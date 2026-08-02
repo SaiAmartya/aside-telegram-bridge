@@ -529,7 +529,7 @@ def run_aside(prompt, session_id=None, model=None, effort=None):
     if session_id:
         cmd += ["--session", session_id]
     if model:
-        cmd += ["-m", model]
+        cmd += ["-m", MODEL_IDS.get(model, model)]
     if effort:
         cmd += ["--effort", effort]
     cmd.append(prompt)
@@ -577,6 +577,28 @@ MODEL_ALIASES = CONFIG.get("model_aliases") or {
     "sonnet": "claude-sonnet-5",
     "fable": "claude-fable-5",
     "opus": "claude-opus-4-8",
+}
+
+# `aside exec -m <id>` resolves a bare model id against the account's
+# default provider (currently openai-codex), so a bare claude id fails
+# as "openai-codex/claude-sonnet-5 is not available for this account".
+# Qualify every model the bridge speaks with the provider that actually
+# hosts it. This is what makes /new (which creates a fresh session)
+# work instead of silently leaving an empty session dir behind. Keys
+# are the bare ids used in state, config and model_aliases; values are
+# what `aside exec -m` accepts.
+MODEL_IDS = CONFIG.get("model_ids") or {
+    "claude-sonnet-5": "claude-code/claude-sonnet-5",
+    "claude-fable-5": "claude-code/claude-fable-5",
+    "claude-opus-4-8": "claude-code/claude-opus-4-8",
+    "claude-opus-5": "claude-code/claude-opus-5",
+    "claude-haiku-4-5": "claude-code/claude-haiku-4-5",
+    "gpt-5.6": "openai-codex/gpt-5.6-luna",
+    "gpt-5.6-luna": "openai-codex/gpt-5.6-luna",
+    "gpt-5.6-terra": "openai-codex/gpt-5.6-terra",
+    "gpt-5.5": "openai-codex/gpt-5.5",
+    "gpt-5.4": "openai-codex/gpt-5.4",
+    "gpt-5.4-mini": "openai-codex/gpt-5.4-mini",
 }
 
 CONTEXT_WINDOWS = CONFIG.get("context_windows") or {
@@ -1086,6 +1108,17 @@ def heavy_new():
         if not sid:
             send_text("session created but i couldn't find its id, "
                       "check the log")
+            return
+        # aside exec exits 0 even when the provider refuses the very
+        # first turn (bad/unauthorized model), which writes a transcript
+        # with stopReason="error" and no content. Without this check the
+        # bridge would switch onto a session that dies on its first real
+        # message.
+        mf = session_msg_file(sid)
+        failed = read_error_since(mf, 0) if mf else ""
+        if failed:
+            send_text("fresh session couldn't start: %s -- try "
+                      "/model sonnet" % failed[:200])
             return
         state["session_id"] = sid
         save_json(STATE_PATH, state)
