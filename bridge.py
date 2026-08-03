@@ -278,14 +278,53 @@ _PRESET = _style_preset(STYLE_NAME)
 DEFAULT_PERSONA = _PRESET["persona"]
 STYLE_TAG = CONFIG.get("style_tag") or _PRESET["tag"]
 
+def detect_aside_root():
+    """The Aside account directory this machine is signed in to.
+
+    Mirrors setup.py's detection (and desktop.ts's) so an empty path in
+    config.json resolves to the account the desktop app is actually using,
+    not a hardcoded u/0. Anything the file cannot be read as an object with
+    a plain non-negative integer id falls back to u/0, which is both the
+    old behaviour and the right answer for a single-account install.
+    """
+    accounts = os.path.expanduser("~/.aside/accounts.json")
+    try:
+        with open(accounts, encoding="utf-8", errors="replace") as f:
+            parsed = json.load(f)
+        current = parsed.get("currentAccountId") if isinstance(parsed, dict) \
+            else None
+        # isinstance(True, int) is True in Python, and u/True is not an
+        # account directory.
+        if isinstance(current, int) and not isinstance(current, bool) \
+                and current >= 0:
+            return os.path.expanduser("~/.aside/u/%d" % current)
+    except (OSError, ValueError, TypeError):
+        pass
+    return os.path.expanduser("~/.aside/u/0")
+
+
+def config_path(key, fallback):
+    """A path from config.json, where EMPTY means "work it out yourself".
+
+    `CONFIG.get(key, default)` only applies the default when the key is
+    ABSENT -- and config.example.json ships these three keys present and
+    empty on purpose, so the documented manual install ("copy the example,
+    fill in token/chat_id/owner_name") produced SESSIONS_DIR="" and
+    ASIDE_CLI="", i.e. os.listdir('') and a spawn of ''. Empty now means
+    the same thing the example says it means: detect it.
+    """
+    raw = str(CONFIG.get(key) or "").strip()
+    return os.path.expanduser(raw or fallback)
+
+
 TOKEN = CONFIG["token"]
 CHAT_ID = CONFIG["chat_id"]
 API = "https://api.telegram.org/bot%s/" % TOKEN
 OWNER = CONFIG.get("owner_name", "the user")
-SESSIONS_DIR = os.path.expanduser(CONFIG.get(
-    "sessions_dir", "~/.aside/u/0/sessions"))
-ASIDE_CLI = os.path.expanduser(CONFIG.get(
-    "aside_cli", "~/.aside/cli/Aside CLI.app/Contents/MacOS/aside"))
+SESSIONS_DIR = config_path(
+    "sessions_dir", os.path.join(detect_aside_root(), "sessions"))
+ASIDE_CLI = config_path(
+    "aside_cli", "~/.aside/cli/Aside CLI.app/Contents/MacOS/aside")
 EXEC_TIMEOUT = int(CONFIG.get("exec_timeout_seconds", 1200))
 PERSONA_PROMPT = CONFIG.get("persona_prompt") or \
     DEFAULT_PERSONA.format(owner=OWNER)
@@ -464,11 +503,31 @@ def session_msg_file(session_id):
     return None
 
 
+def open_transcript(path):
+    """Open a session transcript for reading, tolerating bad bytes.
+
+    Every read here is of a file another process is appending to, so a
+    read can land mid-character and split a multi-byte sequence. Plain
+    `open()` decodes strictly and raises UnicodeDecodeError from the line
+    ITERATOR -- outside the per-line `except ValueError` that guards
+    json.loads, and not an OSError, so none of the callers' handlers
+    caught it. In the poll loop that is an uncaught traceback on a file
+    that will be perfectly readable a millisecond later.
+
+    `errors="replace"` turns a torn character into U+FFFD, which makes
+    that one line fail json.loads and be skipped by the guard that is
+    already there -- degrading by a line instead of by a process. The
+    encoding is pinned too: these files are UTF-8 whatever the machine's
+    locale says.
+    """
+    return open(path, encoding="utf-8", errors="replace")
+
+
 def read_assistant_since(msg_file, byte_offset):
     """Return assistant text written after byte_offset."""
     texts = []
     try:
-        with open(msg_file) as f:
+        with open_transcript(msg_file) as f:
             f.seek(byte_offset)
             for line in f:
                 try:
@@ -485,7 +544,7 @@ def read_assistant_since(msg_file, byte_offset):
     return "\n\n".join(texts)
 
 
-def read_error_since(msg_file, byte_offset):
+def read_error_since(msg_file, byte_offset, strict=False):
     """Return the provider error this turn failed with, or "".
 
     A refused turn is written as an assistant row with
@@ -496,10 +555,17 @@ def read_error_since(msg_file, byte_offset):
     exits 0, and the turn used to be reported as "done, but no text
     came back. odd." That is a rate limit, and saying so is the
     difference between a user retrying later and a user thinking the
-    mac is broken."""
+    mac is broken.
+
+    `strict=True` re-raises instead of reporting an unreadable file as
+    "no error found". Reporting a turn's outcome can safely degrade to
+    silence; DECIDING that a session is healthy cannot -- see heavy_new,
+    where a swallowed read failure would activate the very session this
+    check exists to reject.
+    """
     err = ""
     try:
-        with open(msg_file) as f:
+        with open_transcript(msg_file) as f:
             f.seek(byte_offset)
             for line in f:
                 try:
@@ -514,7 +580,8 @@ def read_error_since(msg_file, byte_offset):
                 if text:
                     err = text
     except OSError:
-        pass
+        if strict:
+            raise
     return err
 
 
@@ -562,7 +629,7 @@ def newest_session_id(exclude, must_contain=None, newer_than=0):
             if must_contain:
                 mf = os.path.join(path, "messages.jsonl")
                 try:
-                    with open(mf) as f:
+                    with open_transcript(mf) as f:
                         if must_contain.lower() not in f.read().lower():
                             continue
                 except OSError:
@@ -573,11 +640,29 @@ def newest_session_id(exclude, must_contain=None, newer_than=0):
     return best
 
 
-MODEL_ALIASES = CONFIG.get("model_aliases") or {
+def merged_map(key, defaults):
+    """`defaults`, with the config's own entries laid over the top.
+
+    These maps used to be `CONFIG.get(key) or {defaults}`, which is
+    all-or-nothing: naming ONE model in config.json silently discarded
+    every other built-in entry. config.example.json ships a short
+    illustrative map, so the documented way to customise one model was
+    also the way to break the other ten -- and the breakage is invisible
+    until a /model that used to work starts sending an unqualified id.
+    Merging makes a partial map mean what it looks like it means.
+    """
+    out = dict(defaults)
+    override = CONFIG.get(key)
+    if isinstance(override, dict):
+        out.update(override)
+    return out
+
+
+MODEL_ALIASES = merged_map("model_aliases", {
     "sonnet": "claude-sonnet-5",
     "fable": "claude-fable-5",
     "opus": "claude-opus-4-8",
-}
+})
 
 # `aside exec -m <id>` resolves a bare model id against the account's
 # default provider (currently openai-codex), so a bare claude id fails
@@ -587,7 +672,7 @@ MODEL_ALIASES = CONFIG.get("model_aliases") or {
 # work instead of silently leaving an empty session dir behind. Keys
 # are the bare ids used in state, config and model_aliases; values are
 # what `aside exec -m` accepts.
-MODEL_IDS = CONFIG.get("model_ids") or {
+MODEL_IDS = merged_map("model_ids", {
     "claude-sonnet-5": "claude-code/claude-sonnet-5",
     "claude-fable-5": "claude-code/claude-fable-5",
     "claude-opus-4-8": "claude-code/claude-opus-4-8",
@@ -599,15 +684,34 @@ MODEL_IDS = CONFIG.get("model_ids") or {
     "gpt-5.5": "openai-codex/gpt-5.5",
     "gpt-5.4": "openai-codex/gpt-5.4",
     "gpt-5.4-mini": "openai-codex/gpt-5.4-mini",
-}
+})
 
-CONTEXT_WINDOWS = CONFIG.get("context_windows") or {
+CONTEXT_WINDOWS = merged_map("context_windows", {
     "claude-sonnet-5": 200000,
     "claude-fable-5": 200000,
     "claude-opus-4-8": 200000,
-}
-CREDENTIALS_PATH = os.path.expanduser(CONFIG.get(
-    "credentials_path", "~/.aside/u/0/credentials.json"))
+})
+
+
+def model_switch_hint():
+    """A `/model ...` example that this install will actually accept.
+
+    The refusal message hardcoded "/model sonnet". `sonnet` is only an
+    alias because the DEFAULT alias map has it; an install that sets its
+    own `model_aliases` was told to type a command that would then be
+    read as a literal model id. Name an alias this config really has,
+    and fall back to a known-good qualified id when it has none.
+    """
+    if "sonnet" in MODEL_ALIASES:
+        return "/model sonnet"
+    for alias in sorted(MODEL_ALIASES):
+        return "/model %s" % alias
+    for bare in sorted(MODEL_IDS):
+        return "/model %s" % bare
+    return "/model <model-id>"
+CREDENTIALS_PATH = config_path(
+    "credentials_path",
+    os.path.join(detect_aside_root(), "credentials.json"))
 
 
 def fmt_reset(iso_str):
@@ -657,7 +761,7 @@ def session_stats(session_id):
     if not msg_file:
         return last_total, cost, turns
     try:
-        with open(msg_file) as f:
+        with open_transcript(msg_file) as f:
             for line in f:
                 try:
                     m = json.loads(line)
@@ -751,7 +855,7 @@ def _session_preview(msg_file):
     """(first-user-text snippet, turn count) from a transcript."""
     snippet, turns, fallback = "", 0, ""
     try:
-        with open(msg_file) as f:
+        with open_transcript(msg_file) as f:
             for line in f:
                 try:
                     m = json.loads(line)
@@ -1114,11 +1218,28 @@ def heavy_new():
         # with stopReason="error" and no content. Without this check the
         # bridge would switch onto a session that dies on its first real
         # message.
+        #
+        # An UNREADABLE transcript is not a pass. read_error_since returns
+        # "" both for "no error in there" and for "could not read it at
+        # all", and treating those the same is how the check ends up
+        # waving through the exact session it exists to catch. Say what
+        # happened instead of switching onto something unverified.
         mf = session_msg_file(sid)
-        failed = read_error_since(mf, 0) if mf else ""
+        if not mf or not os.path.isfile(mf):
+            send_text("session %s was created but has no transcript yet, "
+                      "so i can't tell if it started cleanly. not "
+                      "switching to it -- try /new again" % sid)
+            return
+        try:
+            failed = read_error_since(mf, 0, strict=True)
+        except OSError as e:
+            send_text("couldn't read the new session's transcript (%s), "
+                      "so i'm not switching to it -- try /new again"
+                      % str(e)[:120])
+            return
         if failed:
-            send_text("fresh session couldn't start: %s -- try "
-                      "/model sonnet" % failed[:200])
+            send_text("fresh session couldn't start: %s -- try %s"
+                      % (failed[:200], model_switch_hint()))
             return
         state["session_id"] = sid
         save_json(STATE_PATH, state)
