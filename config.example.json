@@ -9,10 +9,14 @@
   "sessions_dir": "~/.aside/u/0/sessions",
   "credentials_path": "~/.aside/u/0/credentials.json",
   "exec_timeout_seconds": 1200,
+  "_comment_model_maps": "These are partial overrides merged over the built-in defaults; add only the entries you want to change.",
   "model_aliases": {
     "sonnet": "claude-sonnet-5",
     "fable": "claude-fable-5",
     "opus": "claude-opus-4-8"
+  },
+  "model_ids": {
+    "claude-sonnet-5": "claude-code/claude-sonnet-5"
   },
   "sessions_list_limit": 8,
   "style": "formal"
