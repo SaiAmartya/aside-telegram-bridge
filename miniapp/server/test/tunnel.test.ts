@@ -77,8 +77,41 @@ describe('assetFor', () => {
     });
   });
 
-  it('refuses platforms cloudflared does not ship for', () => {
-    expect(() => assetFor('win32', 'x64')).toThrow(/not supported/);
+  it('serves Windows now that its checksums are pinned', () => {
+    // win32 used to throw. It ships a bare .exe, not a tarball.
+    expect(assetFor('win32', 'x64')).toEqual({
+      asset: 'cloudflared-windows-amd64.exe',
+      archive: 'raw',
+    });
+    expect(assetFor('win32', 'ia32')).toEqual({
+      asset: 'cloudflared-windows-386.exe',
+      archive: 'raw',
+    });
+  });
+
+  it('refuses platforms cloudflared does not ship for, and says what to do', () => {
+    const run = () => assetFor('aix', 'ppc64');
+    expect(run).toThrow(/no build for aix\/ppc64/);
+    // A refusal that names no way forward is just a dead end.
+    expect(run).toThrow(/MINIAPP_TUNNEL=none/);
+    expect(run).toThrow(/MINIAPP_CLOUDFLARED_PATH/);
+  });
+
+  it('has a pinned checksum for every asset it can select', () => {
+    // A platform mapping with no vendored hash fails closed at download
+    // time, which is a worse way to find out than a failing test.
+    const { assets } = pinnedRelease();
+    for (const platform of ['darwin', 'linux', 'win32'] as NodeJS.Platform[]) {
+      for (const arch of ['x64', 'arm64', 'arm', 'ia32']) {
+        let picked;
+        try {
+          picked = assetFor(platform, arch);
+        } catch {
+          continue;
+        }
+        expect(assets[picked.asset], `${platform}/${arch}`).toBeTruthy();
+      }
+    }
   });
 });
 
@@ -202,6 +235,7 @@ describe('menu button', () => {
     const res = await registerMenuButton(
       'TOKEN',
       'https://abc.trycloudflare.com',
+      987654321,
       fakeFetch,
     );
 
@@ -211,7 +245,7 @@ describe('menu button', () => {
       'https://api.telegram.org/botTOKEN/setChatMenuButton',
     );
     expect(calls[0].body).toEqual(
-      menuButtonPayload('https://abc.trycloudflare.com'),
+      menuButtonPayload('https://abc.trycloudflare.com', 'Aside', 987654321),
     );
   });
 
@@ -220,7 +254,7 @@ describe('menu button', () => {
       json: async () => ({ ok: false, description: 'Unauthorized' }),
     })) as unknown as typeof fetch;
 
-    const res = await registerMenuButton('TOKEN', 'https://x.trycloudflare.com', fakeFetch);
+    const res = await registerMenuButton('TOKEN', 'https://x.trycloudflare.com', undefined, fakeFetch);
     expect(res).toEqual({ ok: false, description: 'Unauthorized' });
   });
 });

@@ -10,20 +10,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SessionList } from './components/SessionList';
 import { Thread } from './components/Thread';
-import { BottomBar, Composer } from './components/Composer';
-import { EffortPicker, ModelPicker, PermissionPicker } from './components/Pickers';
+import { Composer } from './components/Composer';
+import { PermissionPicker } from './components/Pickers';
+import { ModelSheet } from './components/ModelSheet';
 import { CitationSheet } from './components/Citations';
 import { SessionPanel } from './components/SessionPanel';
 import { SettingsScreen } from './components/SettingsScreen';
+import { RestCue, RestHero } from './components/Rest';
 import { StreamFooter, estimateTokens } from './components/StreamFooter';
 import { TodoSection } from './components/TodoSection';
 import { ErrorCard } from './components/ErrorCard';
-import { ChevronLeft, PanelRight, Spinner } from './components/Icons';
+import { ChevronLeft, PanelRight, Settings, Spinner } from './components/Icons';
 import type { CitationMark } from './utils/citations';
 import { api, setAuthToken } from './api';
 import { useThread } from './hooks/useThread';
 import { useAttachments } from './hooks/useAttachments';
-import { resolvePills } from './utils/pills';
+import { reconcilePick, resolvePills, resolveThreadModel } from './utils/pills';
 import {
   applyTheme,
   backButton,
@@ -33,7 +35,7 @@ import {
   readInitData,
   stashDevInitData,
 } from './telegram';
-import type { SessionRow, StatusResponse } from './types';
+import type { CatalogProvider, SessionRow, StatusResponse } from './types';
 
 /**
  * A thread on the navigation stack.
@@ -55,7 +57,6 @@ type AuthState =
 type PickerState =
   | { kind: 'none' }
   | { kind: 'model'; anchor: HTMLElement }
-  | { kind: 'effort'; anchor: HTMLElement }
   | { kind: 'permission'; anchor: HTMLElement };
 
 const PROVIDER_KEY = 'miniapp.provider';
@@ -95,6 +96,22 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const attachments = useAttachments();
+
+  /**
+   * The home scroller and the history block inside it.
+   *
+   * Home is one tall scroll: a full-viewport resting panel, then the
+   * session list below it. Both refs exist so the Recents cue can drive
+   * the same movement the swipe does, and so backing out of a thread
+   * returns to the resting panel rather than wherever the list was left.
+   */
+  const homeScroll = useRef<HTMLDivElement>(null);
+  const historyRef = useRef<HTMLDivElement>(null);
+
+  const scrollToHistory = useCallback(() => {
+    haptic('light');
+    historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
 
   // A chosen model/effort sticks across launches; until one is chosen the
   // pills mirror whatever the daemon's own default is.
@@ -153,11 +170,37 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * Re-read the catalog and the daemon's default.
+   *
+   * The server rebuilds its catalog from the desktop app's own
+   * models.json/settings.json on a 5s TTL, but the client used to fetch
+   * `/status` exactly once at launch -- so every one of those refreshes
+   * was invisible to the phone, which kept offering models the desktop had
+   * deleted and kept showing a default the desktop had changed. A Mini App
+   * webview is routinely left open for days.
+   */
+  const refreshStatus = useCallback(async () => {
+    try {
+      setStatus(await api.status());
+    } catch {
+      // Keep whatever we last knew rather than blanking the pickers.
+    }
+  }, []);
+
   useEffect(() => {
     if (auth.phase !== 'ready') return;
     void loadSessions();
-    api.status().then(setStatus, () => {});
-  }, [auth.phase, loadSessions]);
+    void refreshStatus();
+  }, [auth.phase, loadSessions, refreshStatus]);
+
+  // A bounded refresh, so a long-lived webview converges on the desktop's
+  // current model list without anyone reopening the app.
+  useEffect(() => {
+    if (auth.phase !== 'ready') return undefined;
+    const timer = window.setInterval(refreshStatus, 60_000);
+    return () => window.clearInterval(timer);
+  }, [auth.phase, refreshStatus]);
 
   // --- navigation ---------------------------------------------------------
   const screen = stack[stack.length - 1] as ThreadScreenState | undefined;
@@ -200,6 +243,23 @@ export default function App() {
    * browser would use. The precedence lives in `resolvePills`, which is
    * tested directly.
    */
+  /**
+   * Drop a stored pick the desktop no longer offers.
+   *
+   * Runs on every status refresh, so a model deleted in the desktop app
+   * stops being selected — and stops being SENT — within one refresh
+   * rather than never. A pick the catalog still lists is left exactly
+   * alone: pinning a model on purpose has to survive this.
+   */
+  useEffect(() => {
+    const next = reconcilePick(status?.catalog, { provider, modelId });
+    if (!next) return;
+    setProvider(next.provider);
+    setModelId(next.modelId);
+    localStorage.removeItem(PROVIDER_KEY);
+    localStorage.removeItem(MODEL_KEY);
+  }, [status, provider, modelId]);
+
   const pills = useMemo(
     () => resolvePills(status, { provider, modelId, effort }),
     [status, provider, modelId, effort],
@@ -271,8 +331,14 @@ export default function App() {
     );
   }
 
-  const openModel = (anchor: HTMLElement) => setPicker({ kind: 'model', anchor });
-  const openEffort = (anchor: HTMLElement) => setPicker({ kind: 'effort', anchor });
+  const openModel = (anchor: HTMLElement) => {
+    // Opening the picker is the moment the list on screen has to be the
+    // list the desktop actually has. The sheet renders from whatever
+    // `status` holds now and re-renders when this lands, so there is no
+    // spinner and no wait.
+    void refreshStatus();
+    setPicker({ kind: 'model', anchor });
+  };
   const openPermission = (anchor: HTMLElement) =>
     setPicker({ kind: 'permission', anchor });
   const closePicker = () => setPicker({ kind: 'none' });
@@ -293,25 +359,19 @@ export default function App() {
     onToggleConfirm: (next: boolean) => void;
   }) =>
     picker.kind === 'model' && status ? (
-      <ModelPicker
-        anchor={picker.anchor}
+      <ModelSheet
         catalog={status.catalog}
         currentProvider={current.provider}
         currentModel={current.modelId}
-        onPick={pickModel}
+        effortOptions={status.effortMenu}
+        currentEffort={current.effortId}
+        onPickModel={pickModel}
+        onPickEffort={pickEffort}
         onClose={closePicker}
         onOpenSettings={() => {
           closePicker();
           setSettingsOpen(true);
         }}
-      />
-    ) : picker.kind === 'effort' && status ? (
-      <EffortPicker
-        anchor={picker.anchor}
-        options={status.effortMenu}
-        current={current.effortId}
-        onPick={pickEffort}
-        onClose={closePicker}
       />
     ) : picker.kind === 'permission' ? (
       <PermissionPicker
@@ -336,8 +396,48 @@ export default function App() {
 
   if (!screen) {
     return (
-      <div className="app">
-        <main className="home">
+      <div className="app app-home">
+        {/*
+          One scroller holding two full panels. The composer is NOT in it:
+          it is docked below, so the software keyboard cannot push it out
+          of reach and the history genuinely scrolls up from underneath it,
+          which is the whole point of the layout.
+        */}
+        <main className="home-scroll" ref={homeScroll}>
+          <section className="home-rest">
+            {/*
+              Settings had no route in from this screen at all -- it lived
+              behind a row inside the model picker, which is not somewhere
+              anyone looks for it. One icon, and the otherwise empty top of
+              the resting panel now has a reason to exist.
+            */}
+            <div className="home-topbar">
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => {
+                  haptic('light');
+                  setSettingsOpen(true);
+                }}
+                aria-label="Settings"
+              >
+                <Settings size={19} strokeWidth={1.75} />
+              </button>
+            </div>
+            <RestHero name={auth.phase === 'ready' ? auth.name : undefined} />
+            <RestCue count={sessions.length} onOpen={scrollToHistory} />
+          </section>
+          <section className="home-history" ref={historyRef}>
+            <h2 className="home-history-head">Recents</h2>
+            <SessionList
+              sessions={sessions}
+              onOpen={(id) => openThread({ id })}
+              loading={loadingSessions}
+            />
+          </section>
+        </main>
+
+        <footer className="home-dock">
           <Composer
             variant="home"
             value={draft}
@@ -345,7 +445,6 @@ export default function App() {
             onSubmit={startSession}
             pills={pills}
             onOpenModel={openModel}
-            onOpenEffort={openEffort}
             onOpenPermission={openPermission}
             permissionMode={newMode}
             attachments={attachments.items}
@@ -354,12 +453,7 @@ export default function App() {
             busy={sending}
             disabled={sending}
           />
-          <SessionList
-            sessions={sessions}
-            onOpen={(id) => openThread({ id })}
-            loading={loadingSessions}
-          />
-        </main>
+        </footer>
         {renderPicker({
           ...pills,
           permissionMode: newMode,
@@ -396,13 +490,13 @@ export default function App() {
       // Whether the user has actively chosen; when they have not, the
       // thread shows the session's own model rather than the account
       // default, which is a different thing.
+      catalog={status?.catalog}
       hasModelOverride={Boolean(modelId)}
       hasEffortOverride={Boolean(effort)}
       draft={draft}
       setDraft={setDraft}
       attachments={attachments}
       openModel={openModel}
-      openEffort={openEffort}
       openPermission={openPermission}
       renderPicker={renderPicker}
     />
@@ -416,13 +510,13 @@ function ThreadScreen({
   onInspectSubagent,
   onOpenRecovered,
   pills,
+  catalog,
   hasModelOverride,
   hasEffortOverride,
   draft,
   setDraft,
   attachments,
   openModel,
-  openEffort,
   openPermission,
   renderPicker,
 }: {
@@ -441,13 +535,13 @@ function ThreadScreen({
     effortLabel: string;
     effortId: string;
   };
+  catalog?: CatalogProvider[];
   hasModelOverride: boolean;
   hasEffortOverride: boolean;
   draft: string;
   setDraft: (value: string) => void;
   attachments: ReturnType<typeof useAttachments>;
   openModel: (anchor: HTMLElement) => void;
-  openEffort: (anchor: HTMLElement) => void;
   openPermission: (anchor: HTMLElement) => void;
   renderPicker: (current: {
     provider: string;
@@ -474,16 +568,14 @@ function ThreadScreen({
    * is the one that was missing -- the bar used to show the account
    * default on every session regardless of what it was really using.
    */
+  const chosen = resolveThreadModel({
+    catalog,
+    pills,
+    threadModel: thread.model,
+    hasModelOverride,
+  });
   const effective = {
-    provider: hasModelOverride
-      ? pills.provider
-      : thread.model?.provider || pills.provider,
-    modelId: hasModelOverride
-      ? pills.modelId
-      : thread.model?.modelId || pills.modelId,
-    modelLabel: hasModelOverride
-      ? pills.modelLabel
-      : thread.model?.label || pills.modelLabel,
+    ...chosen,
     effortId: hasEffortOverride
       ? pills.effortId
       : thread.model?.effort || pills.effortId,
@@ -695,7 +787,6 @@ function ThreadScreen({
           onSubmit={send}
           pills={effective}
           onOpenModel={openModel}
-          onOpenEffort={openEffort}
           onOpenPermission={openPermission}
           permissionMode={thread.permissionMode}
           attachments={attachments.items}
@@ -706,6 +797,10 @@ function ThreadScreen({
           streaming={thread.busy}
           onStop={() => void thread.stop()}
           stopping={thread.stopping}
+          context={{
+            used: thread.stats.totalTokens,
+            window: thread.contextWindow,
+          }}
           // A suspended session accepts a send and then hangs on it
           // forever, so the composer refuses rather than jamming.
           blockedReason={
@@ -714,17 +809,6 @@ function ThreadScreen({
               : null
           }
           above={<TodoSection todos={thread.todos} />}
-        />
-        <BottomBar
-          permission={thread.permission}
-          pills={effective}
-          onOpenModel={openModel}
-          onOpenEffort={openEffort}
-          onOpenPermission={openPermission}
-          context={{
-            used: thread.stats.totalTokens,
-            window: thread.contextWindow,
-          }}
         />
       </footer>
 

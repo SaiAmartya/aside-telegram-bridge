@@ -6,7 +6,7 @@ Your full Aside agent -- tools, memory, everything -- living in a Telegram
 chat. Ask it things, send it photos, give it multi-step tasks, watch live
 progress fold into a tidy collapsible worklog when it's done.
 
-## Install (2 minutes)
+## Install (one command)
 
 Open Terminal and paste:
 
@@ -19,15 +19,29 @@ The setup wizard walks you through the rest:
 1. It asks for a bot token -- message [@BotFather](https://t.me/botfather)
    in Telegram, send `/newbot`, copy the token it gives you.
 2. You text your new bot once -- the wizard detects you automatically.
-3. Pick a reply style. Done. The bridge installs itself as a background
+3. Pick a reply style. The chat bridge installs itself as a background
    service and your bot answers from then on, even after reboots.
+4. It then offers the Mini App and defaults to yes. That step builds the
+   web app, so it takes a few minutes on a first run; the chat bridge is
+   already working while it does. It finishes by printing your public
+   URL and pointing your bot's menu button at it.
+
+Budget about two minutes of your attention and a few more of waiting.
+Everything after the token is either automatic or a yes/no.
 
 No dependencies, no pip installs, no webhooks, no ports. Plain Python that
 ships with macOS, talking outbound to Telegram only.
 
 Requirements: a Mac with [Aside](https://aside.so) installed, and a
-Telegram account. The optional [Mini App](#the-mini-app) also needs
-Node 20+.
+Telegram account. The [Mini App](#the-mini-app) also needs Node 20+ --
+the installer checks for it up front and tells you how to add it later if
+it is missing, rather than failing halfway.
+
+Nothing needs configuring by hand. The wizard finds which Aside account
+you are signed in to (`~/.aside/accounts.json`), writes the matching
+session, credential and database paths, and deliberately pins no model:
+the Mini App reads your desktop app's own default and full provider list
+live, so the phone always shows what the browser shows.
 
 ## What it feels like
 
@@ -79,9 +93,18 @@ the full Aside UI, inside Telegram, on the phone you already have out.
 
 https://github.com/user-attachments/assets/d119cb77-8860-463e-87b5-88b98212fc29
 
-| Sessions | Live tool stream | Approvals | Results |
-|:---:|:---:|:---:|:---:|
-| <img src="docs/screenshots/miniapp-sessions.jpg" alt="Every Aside session on the Mac, with live status" width="220"/> | <img src="docs/screenshots/miniapp-live-transcript.jpg" alt="Tool calls and file diffs streaming in as they happen" width="220"/> | <img src="docs/screenshots/miniapp-approval.jpg" alt="An approval request rendered as a card with tappable options" width="220"/> | <img src="docs/screenshots/miniapp-result.jpg" alt="A finished task with rendered markdown and proof screenshot" width="220"/> |
+| Home | Recents | Model &amp; reasoning |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/home.jpg" alt="The mini app home screen: a greeting and the composer, with history one swipe below" width="240"/> | <img src="docs/screenshots/history.jpg" alt="The session list, showing recent Aside chats with timestamps" width="240"/> | <img src="docs/screenshots/models.jpg" alt="The model sheet, listing whatever providers and models the desktop app has configured" width="240"/> |
+
+<sub>Captured from a fixture install: the name, the session titles and the
+provider list above are all invented test data, not anyone's real
+sessions.</sub>
+
+Opening the app lands on a quiet screen: the mark, a greeting and the
+composer. Your history is one swipe below, scrolling up from under the
+composer. The composer itself does not change when you send -- the thread is
+the same screen with the conversation in it.
 
 Tap the **Aside** button next to the message box and you get:
 
@@ -260,6 +283,9 @@ The wizard is the same either way. Fully manual (no wizard): copy
 `owner_name`, chmod 600 it, then install
 `com.aside.telegram-bridge.plist` into `~/Library/LaunchAgents` with the
 paths corrected, and `launchctl bootstrap gui/$(id -u) <plist>`.
+Leave `aside_cli` / `sessions_dir` / `credentials_path` empty and they are
+detected from the Aside account you are signed in to; set any of them and
+your value is kept, including across a later `python3 setup.py`.
 
 Style: `config.json`'s `"style"` is `"formal"` (default, capitalised
 professional prose) or `"casual"` (deliberately lowercase, dry, texting
@@ -268,9 +294,10 @@ slang); you can fully override with your own `"persona_prompt"` /
 creation, so an existing session keeps the voice it was created with:
 re-running `setup.py` with a different style clears the primed session
 for you, but if you hand-edit `config.json` send `/new` to pick the
-change up. `default_effort` (default `high`) sets the thinking
-effort every normal turn runs at; use `/effort` in chat to bump a single
-upcoming turn to any level (off through ultrabrowse).
+change up. `default_effort` sets the thinking effort every normal turn
+runs at -- the wizard writes `medium`, and `high` is the fallback when the
+key is absent entirely; use `/effort` in chat to bump a single upcoming
+turn to any level (off through ultrabrowse).
 
 </details>
 
@@ -298,3 +325,9 @@ upcoming turn to any level (off through ultrabrowse).
 Designed, built, tested, and documented by an Aside agent, working as a
 digital co-founder for [@SaiAmartya](https://github.com/SaiAmartya), who had
 the good ideas, caught the UX regressions, and made the executive calls.
+
+The self-healing Cloudflare tunnel, the live desktop model catalog, Aside
+account auto-detection and the rebuilt mobile UI came from
+[@Parthkkk](https://github.com/Parthkkk), offered back upstream from a fork
+(MIT, copyright retained in `LICENSE`). The provider-qualified model id map
+came from [@mosidevv](https://github.com/mosidevv).

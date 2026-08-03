@@ -24,6 +24,17 @@
   --font-mono: 'Berkeley Mono', 'Geist Mono Variable', 'Geist Mono',
     ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-display: 'Aside Display', 'Geist Variable', 'Geist', sans-serif;
+  /*
+   * The one serif in the app, used for the home greeting and nothing else.
+   *
+   * Nothing is bundled for it on purpose. `ui-serif` resolves to New York
+   * on iOS and macOS, which is where this app actually runs, and New York
+   * is a genuinely good text serif -- a far better result than shipping
+   * another ~40KB of webfont for six words. The rest of the stack is the
+   * usual fallback ladder for everywhere else.
+   */
+  --font-serif: 'Aside Display', ui-serif, 'New York', 'Iowan Old Style',
+    Palatino, Georgia, serif;
 
   --text-xs: 0.75rem;
   --text-sm: 0.875rem;
@@ -96,9 +107,14 @@
   --duration: 0.15s;
 
   /* --- light theme ---------------------------------------------------- */
-  --background: var(--color-white);
+  /*
+   * Matched to `--page` so the thread and the home screen are one surface
+   * rather than two subtly different whites meeting at a header border.
+   */
+  --background: oklch(97.3% 0.004 92);
   --foreground: var(--color-neutral-950);
-  --popover: var(--background);
+  /* Menus stay pure white so they read as floating above the page. */
+  --popover: var(--color-white);
   --popover-foreground: var(--foreground);
 
   --primary: oklch(14.5% 0 0 / 0.95);
@@ -132,8 +148,26 @@
   --surface-secondary-foreground: oklch(14.5% 0 0 / 0.55);
   --surface-tertiary-foreground: oklch(14.5% 0 0 / 0.25);
 
-  /* The page behind the cards sits a hair off-white, as in the sidepanel. */
-  --page: oklch(98.2% 0 0);
+  /*
+   * The page behind the cards.
+   *
+   * Warmed from a dead-neutral off-white to a low-chroma cream. Aside's
+   * own palette is near-neutral and this stays inside that -- 0.004
+   * chroma is below the threshold where a colour reads as tinted -- but
+   * it is the difference between "unstyled white" and a surface that
+   * white cards sit ON. The composer is `--surface-primary`, still pure
+   * white, so it now lifts off the page instead of dissolving into it.
+   */
+  --page: oklch(97.3% 0.004 92);
+
+  /* The warm accent, used only for the home mark. */
+  /*
+   * Clay, not rust. At 0.118 chroma on hue 40 the mark read as signal red,
+   * and the Aside symbol is a circle with a diagonal through it -- in red
+   * that shape says "prohibited", not "brand". Pulling chroma down and
+   * hue toward amber keeps the warmth without the warning.
+   */
+  --mark-warm: oklch(63% 0.088 52);
 
   /* Ultrabrowse renders as rainbow text; these are its stops. */
   --ultrabrowse-red: var(--color-red-500);
@@ -184,6 +218,7 @@
   --surface-tertiary-foreground: oklch(98.5% 0 0 / 0.25);
 
   --page: var(--color-neutral-900);
+  --mark-warm: oklch(72% 0.105 45);
 
   --ultrabrowse-red: var(--color-red-400);
   --ultrabrowse-orange: var(--color-orange-400);

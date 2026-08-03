@@ -94,12 +94,17 @@ describe('integration smoke', () => {
   });
 
   it('rejects an unauthenticated WebSocket', async () => {
+    // Refused at the handshake now, rather than upgraded and then closed
+    // with 4401: a bad token must not cost a slot in the client pool. The
+    // client sees the failed upgrade as an `error`, not an `open`.
     const ws = new WebSocket(`${base.replace('http', 'ws')}/ws?token=garbage`);
-    const closed = await new Promise<number>((resolve) => {
-      ws.on('close', resolve);
-      ws.on('error', () => resolve(-1));
+    const outcome = await new Promise<string>((resolve) => {
+      ws.on('open', () => resolve('opened'));
+      ws.on('close', () => resolve('closed'));
+      ws.on('error', () => resolve('refused'));
     });
-    expect(closed).toBe(4401);
+    expect(outcome).toBe('refused');
+    ws.terminate();
   });
 
   /**

@@ -171,6 +171,12 @@ interface ScanResult {
   turns: number;
   lastTotalTokens: number;
   totalCost: number;
+  /**
+   * True when the transcript was too big to read whole, so `turns` and
+   * `totalCost` count only the window that was read. Title and preview
+   * are still real -- see `readScanWindow`.
+   */
+  truncated?: boolean;
 }
 
 /** One pass over a transcript for everything the session list shows. */
@@ -245,20 +251,124 @@ interface CacheEntry extends ScanResult {
 const MAX_SCAN_CACHE = 300;
 const scanCache = new Map<string, CacheEntry>();
 
-function scanCached(msgFile: string, stat: fs.Stats): ScanResult {
+/**
+ * Most of one transcript that the LIST will ever read.
+ *
+ * The list needs two things out of a transcript: the first user message
+ * (the title) and the last assistant paragraph (the preview). It was
+ * getting them by reading the whole file -- `readFileSync(msgFile,'utf8')`
+ * with no cap at all, once per row, synchronously, for up to 100 rows.
+ * The thread path caps a single transcript at 32MB precisely because they
+ * get that big here; 100 of those is 3.2GB of string allocation to draw a
+ * list of titles, on the event loop, before a single byte of response.
+ *
+ * 1MB is far more than any real session needs for a title and a preview
+ * (a 1MB head is thousands of messages), and past it the window below
+ * reads the two ENDS instead -- which is where both answers actually live.
+ */
+export const MAX_SCAN_BYTES = 1024 * 1024;
+
+/**
+ * Most of ONE list build. A directory of oversized transcripts must not
+ * turn into an unbounded read just because each file is individually
+ * under the per-file cap.
+ */
+export const MAX_SCAN_TOTAL_BYTES = 24 * 1024 * 1024;
+
+/** Half of the window is taken from each end of an oversized transcript. */
+const SCAN_EDGE_BYTES = MAX_SCAN_BYTES / 2;
+
+/**
+ * A per-request byte budget, so one list cannot read the whole directory.
+ *
+ * Handed down through `localScan`; when it runs out the remaining rows
+ * fall back to metadata only, which is a title of "(too long to preview)"
+ * rather than a stalled response.
+ */
+export interface ScanBudget {
+  remaining: number;
+}
+
+export function newScanBudget(total = MAX_SCAN_TOTAL_BYTES): ScanBudget {
+  return { remaining: total };
+}
+
+/**
+ * The bytes of `msgFile` worth scanning: the whole file when it is small,
+ * otherwise its head and its tail with the middle dropped.
+ *
+ * Reading both ends rather than just the head is what keeps an oversized
+ * session honest in the list: the title comes from the first user message
+ * and the preview from the last assistant one, so a head-only read would
+ * silently blank the preview on exactly the longest conversations. The
+ * partial line at each seam is discarded -- `scanTranscript` would skip it
+ * anyway, but dropping it here keeps the joined buffer well-formed.
+ */
+export function readScanWindow(
+  msgFile: string,
+  size: number,
+  maxBytes = MAX_SCAN_BYTES,
+): string {
+  if (size <= maxBytes) return fs.readFileSync(msgFile, 'utf8');
+
+  const edge = Math.max(1, Math.floor(Math.min(SCAN_EDGE_BYTES, maxBytes / 2)));
+  const fd = fs.openSync(msgFile, 'r');
+  try {
+    const head = Buffer.alloc(edge);
+    const headRead = fs.readSync(fd, head, 0, edge, 0);
+    const tail = Buffer.alloc(edge);
+    const tailRead = fs.readSync(fd, tail, 0, edge, Math.max(0, size - edge));
+
+    // Drop the truncated line at the end of the head and the start of the
+    // tail; both are fragments of records that continue past the cut.
+    const headText = head.subarray(0, headRead).toString('utf8');
+    const tailText = tail.subarray(0, tailRead).toString('utf8');
+    const headCut = headText.lastIndexOf('\n');
+    const tailCut = tailText.indexOf('\n');
+    return `${headCut >= 0 ? headText.slice(0, headCut) : ''}\n${
+      tailCut >= 0 ? tailText.slice(tailCut + 1) : ''
+    }`;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function scanCached(
+  msgFile: string,
+  stat: fs.Stats,
+  budget?: ScanBudget,
+): ScanResult {
   const hit = scanCache.get(msgFile);
   if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) {
     scanCache.delete(msgFile);
     scanCache.set(msgFile, hit);
     return hit;
   }
+
+  // A cache miss is what costs; a hit above is free and is not charged.
+  const cost = Math.min(stat.size, MAX_SCAN_BYTES);
+  if (budget && budget.remaining <= 0) {
+    return {
+      title: '',
+      preview: '',
+      turns: 0,
+      lastTotalTokens: 0,
+      totalCost: 0,
+      truncated: true,
+    };
+  }
+  if (budget) budget.remaining -= cost;
+
   let buffer = '';
   try {
-    buffer = fs.readFileSync(msgFile, 'utf8');
+    buffer = readScanWindow(msgFile, stat.size);
   } catch {
     // unreadable transcript: fall through to an empty scan
   }
-  const scanned = scanTranscript(buffer);
+  const scanned = {
+    ...scanTranscript(buffer),
+    truncated: stat.size > MAX_SCAN_BYTES,
+  };
   scanCache.delete(msgFile);
   scanCache.set(msgFile, {
     ...scanned,
@@ -317,11 +427,12 @@ export function listSessions(
 
   rows.sort((a, b) => b.mtime - a.mtime);
 
+  const budget = newScanBudget();
   return rows.slice(0, Math.max(0, limit)).map((row) => ({
     id: row.id,
     date: row.date,
     mtime: row.mtime,
-    ...scanCached(row.msgFile, row.stat),
+    ...scanCached(row.msgFile, row.stat, budget),
   }));
 }
 
@@ -338,13 +449,19 @@ export function listSessions(
 function localScan(
   sessionsDir: string,
   id: string,
+  budget?: ScanBudget,
 ): { title: string; preview: string } {
   const dir = resolveSessionDir(sessionsDir, id);
   if (!dir) return { title: '', preview: '' };
   const msgFile = path.join(dir, 'messages.jsonl');
   const stat = fs.statSync(msgFile, { throwIfNoEntry: false });
   if (!stat?.isFile()) return { title: '', preview: '' };
-  const scanned = scanCached(msgFile, stat);
+  const scanned = scanCached(msgFile, stat, budget);
+  // A row that fell off the end of the budget says so rather than
+  // pretending the session is empty.
+  if (scanned.truncated && !scanned.title && !scanned.preview) {
+    return { title: '', preview: '(too long to preview)' };
+  }
   return { title: scanned.title, preview: scanned.preview };
 }
 
@@ -356,6 +473,23 @@ const PLACEHOLDER_TITLES = new Set(['', 'aside cli', 'new session', 'untitled'])
 
 export function isPlaceholderTitle(title: string): boolean {
   return PLACEHOLDER_TITLES.has(String(title || '').trim().toLowerCase());
+}
+
+/**
+ * A title derived from a session's own transcript.
+ *
+ * `localScan` already did this for the list, but privately. The thread
+ * route needs the same answer for the same reason -- a session the daemon
+ * has called "Aside CLI" should read the same in the header as it does in
+ * the row above it -- so the derivation is exported rather than
+ * reimplemented. Returns '' when there is nothing to derive from, which
+ * the caller treats as "keep whatever the daemon said".
+ */
+export function titleFromTranscript(
+  sessionsDir: string,
+  id: string,
+): string {
+  return localScan(sessionsDir, id).title;
 }
 
 function timeOf(iso: string | undefined): number {
@@ -394,10 +528,14 @@ export async function listSessionRows(
   stateDb?: { list: (limit?: number) => Promise<StateSessionRow[] | null> },
 ): Promise<{ rows: SessionRow[]; source: 'statedb' | 'facade' | 'filesystem' }> {
   const dbRows = stateDb ? await stateDb.list(limit).catch(() => null) : null;
+  // One budget for the whole list: `limit` is 100 by default and these
+  // reads are synchronous, so the cap has to be across the request, not
+  // just per file.
+  const budget = newScanBudget();
 
   if (dbRows && dbRows.length) {
     const rows = dbRows.slice(0, limit).map((s) => {
-      const local = localScan(sessionsDir, s.id);
+      const local = localScan(sessionsDir, s.id, budget);
       const title = isPlaceholderTitle(s.title) ? local.title : s.title;
       return {
         id: s.id,
@@ -425,7 +563,7 @@ export async function listSessionRows(
       .filter((s) => s && typeof s.id === 'string' && !s.incognito)
       .map((s) => {
         const updatedAt = timeOf(s.updatedAt) || timeOf(s.createdAt);
-        const local = localScan(sessionsDir, s.id);
+        const local = localScan(sessionsDir, s.id, budget);
         const title = isPlaceholderTitle(s.title || '')
           ? local.title
           : (s.title || '').trim();
@@ -454,4 +592,65 @@ export async function listSessionRows(
     unread: false,
   }));
   return { rows, source: 'filesystem' };
+}
+
+/**
+ * How long a just-created session may take to put a transcript on disk,
+ * and how often to look. Shared with the WebSocket subscribe path so both
+ * transports agree on what "not there yet" means.
+ */
+export const NEW_SESSION_WAIT_MS = 30_000;
+export const NEW_SESSION_POLL_MS = 250;
+
+/**
+ * Resolve a session's transcript, waiting if it is still being created.
+ *
+ * `aside exec` hands back a session id as soon as its DIRECTORY appears;
+ * messages.jsonl lands a moment later. The WebSocket already treated that
+ * gap as a wait, but the REST `/thread` route answered 404 the instant the
+ * file was missing -- so opening a brand new chat flashed
+ * "404: session_not_found" for the fraction of a second before the file
+ * appeared. Observed live: `POST /api/sessions/new` 200, then `/thread`
+ * 404 two milliseconds later, then 200.
+ *
+ * Waiting is only justified while this server is itself mid-turn on that
+ * id, which is exactly the just-created case -- `createSession` marks the
+ * queue running before it returns. Any other unknown id still answers
+ * immediately, so a typo or a stale link never hangs the client.
+ */
+export async function waitForTranscript(
+  sessionsDir: string,
+  id: string,
+  isBusy: (id: string) => boolean,
+  options: {
+    waitMs?: number;
+    pollMs?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<string | null> {
+  const exists = () => {
+    const file = sessionMsgFile(sessionsDir, id);
+    return file && fs.existsSync(file) ? file : null;
+  };
+
+  const immediate = exists();
+  if (immediate) return immediate;
+  if (!isBusy(id)) return null;
+
+  const now = options.now ?? Date.now;
+  const sleep =
+    options.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + (options.waitMs ?? NEW_SESSION_WAIT_MS);
+  const pollMs = options.pollMs ?? NEW_SESSION_POLL_MS;
+
+  for (;;) {
+    await sleep(pollMs);
+    const found = exists();
+    if (found) return found;
+    // A turn that ended without ever writing a transcript failed outright;
+    // there is nothing left to wait for.
+    if (now() > deadline || !isBusy(id)) return null;
+  }
 }

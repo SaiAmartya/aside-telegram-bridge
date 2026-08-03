@@ -145,10 +145,49 @@ export function parseHistory(buffer: string): HistoryMessage[] {
   return out;
 }
 
+/**
+ * Largest transcript this will pull into memory at once.
+ *
+ * The `/messages` route already refused anything past this; the thread
+ * path did not, and the thread path is the hot one -- it runs on every
+ * thread request AND on every WebSocket push, with up to 16 results held
+ * in the thread cache. A 50MB transcript becomes a 50MB string and then
+ * several hundred MB of parsed objects, so a handful of long sessions
+ * could take the process out on a machine that had been up for weeks.
+ *
+ * Matches MAX_TRANSCRIPT_BYTES in app.ts.
+ */
+export const MAX_HISTORY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * True when a transcript is past the cap and cannot be rendered.
+ *
+ * `readHistory` has to fail SAFE -- returning `[]` rather than allocating
+ * half a gigabyte -- but an empty array is indistinguishable from "this
+ * chat has no messages", and that is what the thread route was serving: a
+ * blank conversation, 200 OK, no explanation, for a session full of work.
+ * Callers that can say something better ask this first and answer 413
+ * `transcript_too_large`, which the client already has copy for.
+ */
+export function transcriptTooLarge(
+  msgFile: string,
+  maxBytes = MAX_HISTORY_BYTES,
+): boolean {
+  const stat = fs.statSync(msgFile, { throwIfNoEntry: false });
+  return Boolean(stat?.isFile() && stat.size > maxBytes);
+}
+
 /** Read and parse a session transcript. Missing/unreadable reads as empty. */
-export function readHistory(msgFile: string): HistoryMessage[] {
+export function readHistory(
+  msgFile: string,
+  maxBytes = MAX_HISTORY_BYTES,
+): HistoryMessage[] {
   let buffer = '';
   try {
+    // Stat before read: the point is to never allocate the string at all.
+    const stat = fs.statSync(msgFile, { throwIfNoEntry: false });
+    if (!stat?.isFile()) return [];
+    if (stat.size > maxBytes) return [];
     buffer = fs.readFileSync(msgFile, 'utf8');
   } catch {
     return [];

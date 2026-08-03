@@ -29,6 +29,7 @@ import {
   modelLabel,
   readProviderIds,
 } from './catalog.js';
+import { readDesktopState } from './desktop.js';
 import { StateDb, isFullAccess, isSuspended } from './statedb.js';
 import { SettingsStore, defaultSettingsPath, resolveNewSessionModel } from './settings.js';
 import { stripAgentDirectives, withPreamble, withReminder } from './preamble.js';
@@ -51,7 +52,7 @@ import {
   MAX_LOCAL_IMAGE_BYTES,
   localFileRoots,
   localFileStatus,
-  resolveLocalFile,
+  openLocalFile,
 } from './localfiles.js';
 import {
   PERMISSION_MENU,
@@ -75,14 +76,17 @@ import {
 import { TokenError, bearerFrom, mintToken, verifyToken } from './auth.js';
 import { parseTranscript } from './transcript.js';
 import { buildThread } from './thread.js';
-import { readHistory } from './jsonl.js';
+import { readHistory, transcriptTooLarge } from './jsonl.js';
 import {
   firstUserText,
   isMobileSession,
+  isPlaceholderTitle,
   isValidSessionId,
   listSessionRows,
   resolveSessionDir,
   sessionMsgFile,
+  titleFromTranscript,
+  waitForTranscript,
 } from './sessions.js';
 import { SoftConfirmStore, defaultSoftConfirmPath } from './softconfirm.js';
 import { TurnRunner } from './exec.js';
@@ -229,13 +233,56 @@ export async function buildServer(
   );
   const uploadsDir = defaultUploadsDir();
 
-  // The catalog is derived from files that do not change while we run, so
-  // it is built once rather than per request. It is also the source of each
-  // model's context window, which the ring divides by.
-  const catalog = buildCatalog(
-    readProviderIds(config.credentialsPath),
-    config.modelCatalogOverrides as any,
-  );
+  // The catalog USED to be built once, on the assumption that its inputs
+  // could not change while we run. That assumption was wrong: the desktop
+  // app rewrites ~/.aside/u/0/models.json whenever a provider or model is
+  // edited, so a catalog frozen at boot goes stale the moment the owner
+  // touches their model list -- which is exactly how the phone ended up
+  // offering models that no longer existed and hiding ones that did.
+  //
+  // Rebuilding is two small cached-by-the-OS file reads, but it is on the
+  // thread-render path, so it is memoised for a few seconds. Short enough
+  // that a change in the desktop shows up on the phone almost at once, long
+  // enough that a burst of requests does not re-read per item.
+  const CATALOG_TTL_MS = 5_000;
+  let catalogCache: ReturnType<typeof buildCatalog> = [];
+  let catalogAt = 0;
+
+  function currentCatalog(): ReturnType<typeof buildCatalog> {
+    const now = Date.now();
+    if (now - catalogAt < CATALOG_TTL_MS && catalogCache.length) {
+      return catalogCache;
+    }
+    const desktop = readDesktopState(config.sessionsDir);
+    catalogCache = buildCatalog(
+      readProviderIds(config.credentialsPath),
+      config.modelCatalogOverrides as any,
+      desktop.providers,
+      [desktop.defaultModel, ...Object.values(desktop.categories)],
+    );
+    catalogAt = now;
+    return catalogCache;
+  }
+
+  /**
+   * Kept as a getter-backed alias so the many existing `catalog` readers
+   * below pick up refreshes without each one having to remember to call
+   * `currentCatalog()`.
+   */
+  const catalog = new Proxy([] as ReturnType<typeof buildCatalog>, {
+    get(_target, prop, receiver) {
+      return Reflect.get(currentCatalog(), prop, receiver);
+    },
+    has(_target, prop) {
+      return Reflect.has(currentCatalog(), prop);
+    },
+    ownKeys() {
+      return Reflect.ownKeys(currentCatalog());
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+      return Reflect.getOwnPropertyDescriptor(currentCatalog(), prop);
+    },
+  }) as ReturnType<typeof buildCatalog>;
 
   /**
    * Subagents of a session, read from the daemon's table and kept warm so
@@ -390,9 +437,31 @@ export async function buildServer(
         return reply.code(400).send({ error: 'bad_session_id' });
       }
 
-      const msgFile = sessionMsgFile(config.sessionsDir, id);
-      if (!msgFile || !fs.existsSync(msgFile)) {
+      /*
+       * Wait for a transcript that is still being written rather than
+       * 404ing on it. See `waitForTranscript`: this is the same rule the
+       * WebSocket already used, and its absence here is what made a brand
+       * new chat flash "404: session_not_found" before it settled.
+       */
+      const msgFile = await waitForTranscript(config.sessionsDir, id, (sid) =>
+        runner.isBusy(sid),
+      );
+      if (!msgFile) {
         return reply.code(404).send({ error: 'session_not_found' });
+      }
+
+      /*
+       * Say so, rather than serving an empty conversation.
+       *
+       * `readHistory` refuses a transcript past the cap and returns an
+       * empty list -- which is correct as a memory guard and a lie as an
+       * answer: the thread rendered as a chat with nothing in it, 200 OK,
+       * with no way to tell that from a genuinely empty session. This is
+       * the same 413 `/messages` already gives, and the client already
+       * turns it into "This chat is too long to open on your phone."
+       */
+      if (transcriptTooLarge(msgFile, MAX_TRANSCRIPT_BYTES)) {
+        return reply.code(413).send({ error: 'transcript_too_large' });
       }
 
       const session = await fetchSession(facade, id).catch(() => null);
@@ -436,9 +505,23 @@ export async function buildServer(
        */
       const mobile = isMobileSession(config.sessionsDir, id);
 
+      /**
+       * The daemon titles every CLI-created session "Aside CLI", and every
+       * session this app starts is CLI-created -- so the header on a
+       * brand-new thread read "Aside CLI" rather than what the
+       * conversation was about. The session LIST already worked around
+       * this (see `isPlaceholderTitle` + `localScan`); the thread route
+       * did not, so the same session showed a real title in the list and a
+       * placeholder once opened. Same rule, applied in both places now.
+       */
+      const rawTitle = session?.title || '';
+      const title = isPlaceholderTitle(rawTitle)
+        ? titleFromTranscript(config.sessionsDir, id) || rawTitle
+        : rawTitle;
+
       return {
         sessionId: id,
-        title: session?.title || '',
+        title,
         status,
         /** Blocked on a desktop-only question; see `isSuspended`. */
         suspended: isSuspended(status),
@@ -590,14 +673,58 @@ export async function buildServer(
 
       // The agent owns this directory and may be rewriting it right now, so
       // the file can disappear between the resolve above and this stat. That
-      // is a 404, not an unhandled throw turning into a 500.
+      // is a 404, not an unhandled throw turning into a 500. The isFile
+      // check also has to come BEFORE any open: opening a fifo blocks.
       const stat = fs.statSync(file, { throwIfNoEntry: false });
       if (!stat?.isFile()) {
         return reply.code(404).send({ error: 'file_not_found' });
       }
-      if (stat.size > MAX_ARTIFACT_BYTES) {
+
+      /*
+       * Open by descriptor, and answer off the descriptor.
+       *
+       * The window this closes is the one between the stat above and the
+       * first byte read: the agent can unlink or truncate the file in it.
+       * `fs.createReadStream(path)` cannot report that -- it opens
+       * asynchronously and reports ENOENT as an `error` EVENT, so a
+       * try/catch around it never fires and the handler had already sent
+       * 200 plus artifact headers by the time the failure arrived. The
+       * client got a successful, empty, correctly-typed response for a
+       * file that was not there.
+       *
+       * `openSync` throws where it can be turned into a 404, and once the
+       * descriptor is held the bytes behind it are stable no matter what
+       * happens to the path -- so the size check below is also being
+       * applied to the same file that is about to be sent, rather than to
+       * whatever the name pointed at a moment ago.
+       */
+      let fd: number;
+      try {
+        fd = fs.openSync(file, 'r');
+      } catch {
+        return reply.code(404).send({ error: 'file_not_found' });
+      }
+
+      let opened: fs.Stats;
+      try {
+        opened = fs.fstatSync(fd);
+      } catch {
+        fs.closeSync(fd);
+        return reply.code(404).send({ error: 'file_not_found' });
+      }
+      if (!opened.isFile()) {
+        fs.closeSync(fd);
+        return reply.code(404).send({ error: 'file_not_found' });
+      }
+      if (opened.size > MAX_ARTIFACT_BYTES) {
+        fs.closeSync(fd);
         return reply.code(413).send({ error: 'file_too_large' });
       }
+
+      const stream = fs.createReadStream(file, { fd, autoClose: true });
+      // A read error after the headers are out cannot become a status
+      // code, but it must not become an unhandled 'error' event either.
+      stream.on('error', () => stream.destroy());
 
       return reply
         .header('content-type', artifactContentType(file))
@@ -606,7 +733,7 @@ export async function buildServer(
         // as markup for our own origin.
         .header('content-security-policy', "sandbox; default-src 'none'")
         .header('x-content-type-options', 'nosniff')
-        .send(fs.createReadStream(file));
+        .send(stream);
     },
   );
 
@@ -644,12 +771,29 @@ export async function buildServer(
         uploadsDir,
         mediaDir: config.mediaDir,
       });
-      const found = resolveLocalFile(roots, query.path, MAX_LOCAL_IMAGE_BYTES);
+      /*
+       * Resolve AND open together -- see `openLocalFile`.
+       *
+       * Containment, content type and the 10 MiB cap used to be decided
+       * from the PATH and then a separate open streamed whatever the name
+       * meant by that point. `openLocalFile` opens with `O_NOFOLLOW` and
+       * re-checks "regular file" and the size cap on the DESCRIPTOR, so
+       * the bytes that were measured are the bytes that go out.
+       */
+      const found = openLocalFile(roots, query.path, MAX_LOCAL_IMAGE_BYTES);
       if (!found.ok) {
         return reply
           .code(localFileStatus(found.reason))
           .send({ error: found.reason });
       }
+
+      const stream = fs.createReadStream(found.file, {
+        fd: found.fd,
+        autoClose: true,
+      });
+      // A read error past the headers cannot become a status code, but it
+      // must not become an unhandled 'error' event either.
+      stream.on('error', () => stream.destroy());
 
       return reply
         .header('content-type', found.contentType)
@@ -658,7 +802,7 @@ export async function buildServer(
         // and must never be treated as markup for our own origin.
         .header('content-security-policy', "sandbox; default-src 'none'")
         .header('x-content-type-options', 'nosniff')
-        .send(fs.createReadStream(found.file));
+        .send(stream);
     },
   );
 
@@ -1251,10 +1395,26 @@ export async function buildServer(
 
     // Aside's own current default, so the pills open showing what the
     // browser shows rather than a config guess.
+    //
+    // Three sources, most authoritative first. The daemon is asked first
+    // because it is the live answer, but it needs a ~139MB process spawn
+    // and fails whenever the desktop app is not running -- and it was
+    // failing to `claude-code` + whatever stale string the bridge config
+    // carried, which is how the phone came to show a model the desktop had
+    // not used in days. settings.json is the same value the daemon would
+    // have reported, read straight off disk, so it is a far better second
+    // than the hand-maintained config.
     const daemonDefault = await fetchDefaultModel(facade).catch(() => null);
-    const provider = daemonDefault?.provider || 'claude-code';
-    const modelId = daemonDefault?.modelId || config.defaultModel;
-    const effort = daemonDefault?.thinkingLevel || config.defaultEffort;
+    const desktop = readDesktopState(config.sessionsDir);
+    const fallback = desktop.defaultModel;
+    const provider =
+      daemonDefault?.provider || fallback?.provider || 'claude-code';
+    const modelId =
+      daemonDefault?.modelId || fallback?.modelId || config.defaultModel;
+    const effort =
+      daemonDefault?.thinkingLevel ||
+      fallback?.thinkingLevel ||
+      config.defaultEffort;
 
     return {
       uptimeMs: Date.now() - startedAt,

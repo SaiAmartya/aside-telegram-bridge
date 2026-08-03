@@ -32,6 +32,7 @@ import {
 import { ContextRing } from './ContextRing';
 import { haptic } from '../telegram';
 import type { ComposerAttachment } from '../types';
+import { pillModelLabel } from '../utils/pills';
 
 export interface PillState {
   modelLabel: string;
@@ -53,7 +54,6 @@ export interface ComposerProps {
   onSubmit: () => void;
   pills: PillState;
   onOpenModel: (anchor: HTMLElement) => void;
-  onOpenEffort: (anchor: HTMLElement) => void;
   onOpenPermission: (anchor: HTMLElement) => void;
   /** Chosen mode, for the badge's tint. Null when unknown. */
   permissionMode: string | null;
@@ -77,6 +77,11 @@ export interface ComposerProps {
    * sending would queue a turn that hangs forever.
    */
   blockedReason?: string | null;
+  /**
+   * Context-window occupancy, drawn as a ring beside the model pill.
+   * Absent on home, where there is no session to measure.
+   */
+  context?: { used: number; window: number };
   /** Rendered directly above the composer: the task list. */
   above?: React.ReactNode;
 }
@@ -103,7 +108,7 @@ export function Pill({
       onClick={() => ref.current && onOpen(ref.current)}
     >
       {mark ? <ProviderMark id={mark} size={13} /> : null}
-      <span className="pill-label">{label}</span>
+      <span className="pill-label">{pillModelLabel(label)}</span>
       <ChevronDown size={13} strokeWidth={1.75} />
     </button>
   );
@@ -192,7 +197,6 @@ export function Composer({
   onSubmit,
   pills,
   onOpenModel,
-  onOpenEffort,
   onOpenPermission,
   permissionMode,
   attachments,
@@ -204,6 +208,7 @@ export function Composer({
   onStop,
   stopping,
   blockedReason,
+  context,
   above,
 }: ComposerProps) {
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -270,7 +275,9 @@ export function Composer({
         value={value}
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={onKeyDown}
-        placeholder={variant === 'home' ? 'Ask AI a task' : 'Reply'}
+        placeholder={
+          variant === 'home' ? 'Chat with Aside…' : 'Reply to Aside…'
+        }
         rows={1}
         disabled={blocked}
       />
@@ -309,23 +316,30 @@ export function Composer({
 
         <PermissionButton mode={permissionMode} onOpen={onOpenPermission} />
 
-        {variant === 'home' ? (
-          <>
-            <span className="composer-spacer" />
-            <Pill
-              label={pills.modelLabel}
-              onOpen={onOpenModel}
-              mark={pills.provider}
-            />
-            <Pill
-              label={pills.effortLabel}
-              onOpen={onOpenEffort}
-              className="pill-effort"
-            />
-          </>
-        ) : (
-          <span className="composer-spacer" />
-        )}
+        {/*
+          Pills sit immediately after the round buttons, with the slack
+          pushed to the right of them -- the arrangement Claude's own
+          composer uses. Right-aligning them (the old order) put the free
+          space between the buttons and the pills, which read as two
+          disconnected clusters rather than one row of controls.
+        */}
+        {/*
+          Both screens carry the same control row. The reply composer used
+          to drop the model pill and push it into a separate bottom bar,
+          so sending a message visibly changed the furniture -- a different
+          card, a different row, the model somewhere else. Claude's own app
+          keeps one composer and only swaps the placeholder, which is why
+          its thread does not feel like a second app.
+        */}
+        {context ? (
+          <ContextRing used={context.used} window={context.window} />
+        ) : null}
+        <Pill
+          label={pills.modelLabel}
+          onOpen={onOpenModel}
+          mark={pills.provider}
+        />
+        <span className="composer-spacer" />
 
         {/*
           Stop sits to the LEFT of send while a turn runs, matching the
@@ -381,17 +395,21 @@ export function BottomBar({
   permission,
   pills,
   onOpenModel,
-  onOpenEffort,
   onOpenPermission,
   context,
+  showContext = true,
 }: {
   permission: string | null;
   pills: PillState;
   onOpenModel: (anchor: HTMLElement) => void;
-  onOpenEffort: (anchor: HTMLElement) => void;
   onOpenPermission: (anchor: HTMLElement) => void;
   /** Context-window occupancy for the ring. */
   context: { used: number; window: number };
+  /**
+   * Home has no session yet, so a ring there could only ever report an
+   * empty window -- a control that cannot mean anything is just noise.
+   */
+  showContext?: boolean;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   const full = Boolean(permission?.toLowerCase().startsWith('full'));
@@ -409,16 +427,17 @@ export function BottomBar({
         </button>
       ) : null}
       <span className="composer-spacer" />
-      <ContextRing used={context.used} window={context.window} />
+      {showContext ? (
+        <ContextRing used={context.used} window={context.window} />
+      ) : null}
+      {/*
+        No effort pill. Reasoning is a row inside the model sheet on every
+        screen, so there is one place to change it and one pill to read.
+      */}
       <Pill
         label={pills.modelLabel}
         onOpen={onOpenModel}
         mark={pills.provider}
-      />
-      <Pill
-        label={pills.effortLabel}
-        onOpen={onOpenEffort}
-        className="pill-effort"
       />
     </div>
   );

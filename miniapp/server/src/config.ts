@@ -74,6 +74,23 @@ export function effortLabel(effort: string): string {
   return EFFORT_LABELS[effort] || effort;
 }
 
+/**
+ * Where the Aside CLI lives, when the config does not say.
+ *
+ * macOS ships it inside an `.app` bundle; everywhere else it is a plain
+ * executable that the installer puts on PATH. Hardcoding the macOS bundle
+ * path meant a Linux user who cloned this repo got `ENOENT` on every
+ * single spawn -- exec, repl and facade alike -- with nothing pointing at
+ * the cause.
+ */
+export function defaultAsideCliPath(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'darwin'
+    ? '~/.aside/cli/Aside CLI.app/Contents/MacOS/aside'
+    : 'aside';
+}
+
 const DEFAULT_MODEL_ALIASES: Record<string, string> = {
   sonnet: 'claude-sonnet-5',
   fable: 'claude-fable-5',
@@ -141,6 +158,48 @@ export function expandHome(p: string): string {
 }
 
 /**
+ * The Aside account directory this machine is actually signed in to.
+ *
+ * Every path in this project used to be hardcoded to `~/.aside/u/0`, which
+ * is only right for someone whose first account is still their current
+ * one. Aside numbers accounts and records the active one in
+ * `~/.aside/accounts.json` as `currentAccountId`; a user on their second
+ * account has all of their sessions, models and credentials under
+ * `~/.aside/u/1`, so a hardcoded `u/0` pointed the whole app at an empty
+ * or stale account with no error to explain why the session list was
+ * blank.
+ *
+ * Falls back to `u/0` when the file is missing or unreadable, which is
+ * both the old behaviour and the correct answer for a single-account
+ * install.
+ */
+export function defaultAsideRoot(home = os.homedir()): string {
+  const override = process.env.MINIAPP_ASIDE_ROOT;
+  if (override) return expandHome(override);
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(home, '.aside/accounts.json'), 'utf8'),
+    ) as { currentAccountId?: unknown };
+    // `Number(true)` is 1 and `Number(false)` is 0, so a boolean here used
+    // to resolve to a real-looking account directory -- silently pointing
+    // the whole app at u/1 because a field was written as `true`. Only an
+    // actual number (or a numeric string) may name an account.
+    const value = raw.currentAccountId;
+    const id =
+      typeof value === 'number' || typeof value === 'string'
+        ? Number(value)
+        : NaN;
+    if (Number.isInteger(id) && id >= 0) {
+      return path.join(home, '.aside/u', String(id));
+    }
+  } catch {
+    // No accounts file (fresh install, or a layout we do not know):
+    // u/0 is the only sensible guess.
+  }
+  return path.join(home, '.aside/u/0');
+}
+
+/**
  * Where the bridge's config.json might live, best candidate first.
  *
  * `setup.py` writes it into the repo checkout, so that is where a wizard
@@ -163,7 +222,7 @@ export function configCandidates(): string[] {
   );
   return [
     path.join(repoRoot, 'config.json'),
-    expandHome('~/.aside/u/0/telegram-bridge/config.json'),
+    path.join(defaultAsideRoot(), 'telegram-bridge/config.json'),
   ];
 }
 
@@ -206,11 +265,11 @@ export function loadConfig(): MiniappConfig {
 
   const sessionsDir = expandHome(
     process.env.MINIAPP_SESSIONS_DIR ||
-      String(raw.sessions_dir || '~/.aside/u/0/sessions'),
+      String(raw.sessions_dir || path.join(defaultAsideRoot(), 'sessions')),
   );
   const asideCli = expandHome(
     process.env.MINIAPP_ASIDE_CLI ||
-      String(raw.aside_cli || '~/.aside/cli/Aside CLI.app/Contents/MacOS/aside'),
+      String(raw.aside_cli || defaultAsideCliPath()),
   );
   const secretPath = expandHome(
     process.env.MINIAPP_SECRET_PATH ||
@@ -218,11 +277,14 @@ export function loadConfig(): MiniappConfig {
   );
   const credentialsPath = expandHome(
     process.env.MINIAPP_CREDENTIALS ||
-      String(raw.credentials_path || '~/.aside/u/0/credentials.json'),
+      String(
+        raw.credentials_path ||
+          path.join(defaultAsideRoot(), 'credentials.json'),
+      ),
   );
   const stateDbPath = expandHome(
     process.env.MINIAPP_STATE_DB ||
-      String(raw.state_db_path || '~/.aside/u/0/state.db'),
+      String(raw.state_db_path || path.join(defaultAsideRoot(), 'state.db')),
   );
 
   // bridge.py writes media next to its own config, which is also where
@@ -284,7 +346,17 @@ export function loadConfig(): MiniappConfig {
   return {
     botToken,
     allowedUserId,
-    defaultModel: String(raw.default_model || 'claude-sonnet-5'),
+    /**
+     * No fallback model id on purpose.
+     *
+     * This used to default to `claude-sonnet-5`, which is only correct for
+     * someone who happens to have Claude connected. For anyone else the
+     * first turn of a fresh install was spent on a model their account
+     * cannot run. Empty means "say nothing", and `-m` is then omitted
+     * entirely so the CLI applies the account's own default -- which is
+     * the answer the desktop app would have given anyway.
+     */
+    defaultModel: String(raw.default_model || ''),
     defaultEffort: asEffort(raw.default_effort, 'high'),
     modelAliases: (raw.model_aliases as Record<string, string>) ||
       DEFAULT_MODEL_ALIASES,

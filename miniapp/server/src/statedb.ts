@@ -19,6 +19,7 @@
  */
 import os from 'node:os';
 import path from 'node:path';
+import { defaultAsideRoot } from './config.js';
 
 /** Shape of the `model` column, which stores JSON rather than a bare id. */
 export interface SessionModel {
@@ -106,7 +107,7 @@ export interface StateChildRow {
 export function defaultStateDbPath(): string {
   return (
     process.env.MINIAPP_STATE_DB ||
-    path.join(os.homedir(), '.aside/u/0/state.db')
+    path.join(defaultAsideRoot(), 'state.db')
   );
 }
 

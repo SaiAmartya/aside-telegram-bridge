@@ -16,6 +16,7 @@
  * provider's list outright.
  */
 import fs from 'node:fs';
+import type { DesktopModelRef, DesktopProvider } from './desktop.js';
 
 export interface CatalogModel {
   /** The id the CLI expects after the slash, e.g. `gpt-5.5`. */
@@ -125,6 +126,8 @@ export function readProviderIds(credentialsPath: string): string[] {
 export function buildCatalog(
   providerIds: string[],
   overrides: Record<string, CatalogOverride> = {},
+  desktop: DesktopProvider[] = [],
+  ensure: Array<DesktopModelRef | null | undefined> = [],
 ): CatalogProvider[] {
   const connectedSet = new Set(providerIds);
   const seedUnknown = providerIds.length === 0;
@@ -147,6 +150,26 @@ export function buildCatalog(
     if (!byId.has(id)) {
       byId.set(id, { id, label: id, models: [], connected: true });
     }
+  }
+
+  // Providers the desktop app has configured in models.json. These are
+  // local gateways addressed by baseUrl rather than by a credentials.json
+  // entry, which is why credential seeding alone never surfaced them and
+  // why they had to be transcribed by hand before. models.json is
+  // authoritative for these, so it REPLACES rather than merges: a model the
+  // desktop has dropped must disappear from the phone too, otherwise the
+  // picker keeps offering ids the gateway will reject.
+  for (const provider of desktop) {
+    byId.set(provider.id, {
+      id: provider.id,
+      label: provider.label || provider.id,
+      models: provider.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        contextWindow: m.contextWindow || DEFAULT_CONTEXT_WINDOW,
+      })),
+      connected: true,
+    });
   }
 
   for (const [id, override] of Object.entries(overrides || {})) {
@@ -186,6 +209,33 @@ export function buildCatalog(
       }
     }
     byId.set(id, target);
+  }
+
+  // Whatever the desktop is actually bound to must be selectable, even if
+  // no other source named it. Without this a fresh model set in the desktop
+  // app renders on the phone as a raw id in a picker that cannot select it.
+  for (const ref of ensure) {
+    if (!ref || !ref.provider || !ref.modelId) continue;
+    const target = byId.get(ref.provider) ?? {
+      id: ref.provider,
+      label: ref.provider,
+      models: [],
+      connected: true,
+    };
+    if (!target.models.some((m) => m.id === ref.modelId)) {
+      target.models = [
+        ...target.models,
+        {
+          id: ref.modelId,
+          label: ref.modelId,
+          contextWindow: DEFAULT_CONTEXT_WINDOW,
+        },
+      ];
+    }
+    // A provider the desktop is actively running is connected by
+    // definition, whatever credentials.json happens to show.
+    target.connected = true;
+    byId.set(ref.provider, target);
   }
 
   // Connected providers first, then built-in order, so the picker opens on

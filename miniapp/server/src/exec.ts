@@ -193,6 +193,22 @@ export function grantFullAccessExpression(sessionId: string): string {
   )}, { permissionMode: 'full-access' })`;
 }
 
+
+/**
+ * `['-m', model]`, or nothing at all.
+ *
+ * An empty model is not an error and must not become `-m ''`, which the
+ * CLI rejects outright. It means "this install has no configured default",
+ * and the right response is to leave the flag off entirely so the CLI
+ * falls back to the account's own default model. That is what a fresh
+ * install with no `default_model` in its config now does, instead of
+ * guessing at a Claude model the user may not have.
+ */
+export function modelArgs(model: string | undefined): string[] {
+  const id = String(model || '').trim();
+  return id ? ['-m', id] : [];
+}
+
 export class TurnRunner extends EventEmitter {
   private queues = new Map<string, SessionQueue>();
   private pendingNew: InFlightTurn[] = [];
@@ -281,8 +297,7 @@ export class TurnRunner extends EventEmitter {
       'exec',
       '--session',
       sessionId,
-      '-m',
-      head.model,
+      ...modelArgs(head.model),
       '--effort',
       head.effort,
       // See `PROMPT_TERMINATOR`. Without this a message beginning with a
@@ -542,8 +557,7 @@ export class TurnRunner extends EventEmitter {
       this.opts.asideCli,
       [
         'exec',
-        '-m',
-        request.model,
+        ...modelArgs(request.model),
         '--effort',
         request.effort,
         // Same reason as the continuation path -- see `PROMPT_TERMINATOR`.
@@ -662,7 +676,30 @@ export class TurnRunner extends EventEmitter {
         ['repl', grantFullAccessExpression(sessionId)],
         { stdio: 'ignore' },
       );
-      child.on('error', () => {});
+      /*
+       * Tracked, bounded and reaped.
+       *
+       * This was fire-and-forget: not in `pendingChildren`, so `shutdown`
+       * never killed it, with no timeout and no close handler. An `aside
+       * repl` that hung against an unresponsive daemon therefore lived
+       * forever, one per session created, holding its pipes open. Being
+       * best-effort is not a reason to leave a process untracked.
+       */
+      this.pendingChildren.add(child);
+      const hard = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }, 10_000);
+      hard.unref?.();
+      const done = () => {
+        clearTimeout(hard);
+        this.pendingChildren.delete(child);
+      };
+      child.on('error', done);
+      child.on('close', done);
     } catch {
       // best effort only
     }

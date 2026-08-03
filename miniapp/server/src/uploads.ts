@@ -25,6 +25,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { defaultAsideRoot } from './config.js';
 
 /** Per-file cap. Telegram's own webview upload limit is well under this. */
 export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -62,7 +63,7 @@ export function sanitizeFilename(raw: unknown): string {
 export function defaultUploadsDir(): string {
   return (
     process.env.MINIAPP_UPLOADS_DIR ||
-    path.join(os.homedir(), '.aside/u/0/telegram-bridge/miniapp-uploads')
+    path.join(defaultAsideRoot(), 'telegram-bridge/miniapp-uploads')
   );
 }
 

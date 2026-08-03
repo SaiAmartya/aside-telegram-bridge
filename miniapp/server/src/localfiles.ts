@@ -151,6 +151,93 @@ export function resolveLocalFile(
   return { ok: true, file: real, contentType, size: stat.size };
 }
 
+export type OpenedLocalFile =
+  | { ok: true; fd: number; file: string; contentType: string; size: number }
+  | { ok: false; reason: LocalFileRefusal };
+
+/**
+ * `O_NOFOLLOW` where the platform has it, 0 where it does not.
+ *
+ * Windows has no such flag, and `fs.constants.O_NOFOLLOW` is undefined
+ * there -- passing `undefined` into the flags bitmask would produce NaN
+ * and fail every open. Falling back to 0 keeps the descriptor-side checks
+ * below, which are the substantive ones; only the "final component is a
+ * symlink" refusal is unavailable, and Windows is not a supported target
+ * for this server anyway.
+ */
+const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/**
+ * Resolve AND open, so the file that is checked is the file that is sent.
+ *
+ * `resolveLocalFile` decides containment, type and size from the PATH. All
+ * three answers stop being true the moment it returns: the agent owns
+ * these directories and rewrites them constantly, so between the
+ * `realpath`/`stat` and the open the name can come to mean a different
+ * file -- a symlink out of the roots, a fifo, or something far larger than
+ * the cap. The route then streamed whatever the name pointed at by then,
+ * with a 200 and an image content-type already committed.
+ *
+ * So the checks move onto the descriptor: `O_NOFOLLOW` refuses to open a
+ * final component that has become a symlink, and `fstat` on the open fd
+ * describes the exact bytes about to be written to the socket, whatever
+ * happened to the path afterwards. The path-side checks are kept because
+ * they are what decides containment and content type in the first place.
+ *
+ * The descriptor is closed on every rejecting path. A leaked fd here is a
+ * slow resource leak on a server meant to run for weeks.
+ */
+export function openLocalFile(
+  roots: string[],
+  raw: unknown,
+  maxBytes = MAX_LOCAL_IMAGE_BYTES,
+): OpenedLocalFile {
+  const resolved = resolveLocalFile(roots, raw, maxBytes);
+  if (!resolved.ok) return resolved;
+
+  let fd: number;
+  try {
+    fd = fs.openSync(resolved.file, fs.constants.O_RDONLY | NOFOLLOW);
+  } catch (err) {
+    // ELOOP is the O_NOFOLLOW refusal: the name became a symlink between
+    // the realpath above and this open. Everything else is a vanished or
+    // unreadable file.
+    const code = (err as NodeJS.ErrnoException).code;
+    return {
+      ok: false,
+      reason: code === 'ELOOP' ? 'forbidden_path' : 'file_not_found',
+    };
+  }
+
+  const reject = (reason: LocalFileRefusal): OpenedLocalFile => {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // already gone
+    }
+    return { ok: false, reason };
+  };
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.fstatSync(fd);
+  } catch {
+    return reject('file_not_found');
+  }
+  // A directory, a fifo, a device or a socket is not an image, and a fifo
+  // in particular would block the stream forever.
+  if (!stat.isFile()) return reject('file_not_found');
+  if (stat.size > maxBytes) return reject('file_too_large');
+
+  return {
+    ok: true,
+    fd,
+    file: resolved.file,
+    contentType: resolved.contentType,
+    size: stat.size,
+  };
+}
+
 /** HTTP status for a refusal. */
 export function localFileStatus(reason: LocalFileRefusal): number {
   switch (reason) {

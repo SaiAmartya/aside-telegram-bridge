@@ -7,7 +7,13 @@
  * never the daemon's, which is what the label fallback used to do.
  */
 import { describe, expect, it } from 'vitest';
-import { catalogLabel, resolvePills } from '../src/utils/pills';
+import {
+  catalogHasModel,
+  catalogLabel,
+  reconcilePick,
+  resolvePills,
+  resolveThreadModel,
+} from '../src/utils/pills';
 import type { StatusResponse } from '../src/types';
 
 const CATALOG = [
@@ -180,5 +186,145 @@ describe('catalogLabel', () => {
     expect(catalogLabel(CATALOG, 'claude-code', 'nope')).toBe('');
     expect(catalogLabel(CATALOG, '', 'claude-fable-5')).toBe('');
     expect(catalogLabel(undefined, 'claude-code', 'claude-fable-5')).toBe('');
+  });
+});
+
+/**
+ * Finding 2: a stored pick outliving the model it names.
+ *
+ * The server rebuilds its catalog from the desktop app live, but the PICK
+ * lives in localStorage and used to be trusted forever -- so deleting a
+ * provider in the desktop app left the phone showing the old model, keeping
+ * it selected, and sending `provider/modelId` on every turn for a model the
+ * CLI would then refuse.
+ */
+describe('reconcilePick', () => {
+  it('drops a pick the catalog no longer lists', () => {
+    expect(
+      reconcilePick(CATALOG, { provider: 'openrouter', modelId: 'gone-model' }),
+    ).toEqual({ provider: '', modelId: '' });
+  });
+
+  it('drops a pick whose provider survived but whose model did not', () => {
+    expect(
+      reconcilePick(CATALOG, { provider: 'claude-code', modelId: 'claude-opus-9' }),
+    ).toEqual({ provider: '', modelId: '' });
+  });
+
+  it('leaves a deliberately pinned model that is still offered', () => {
+    // Pinning a model on purpose has to survive every refresh.
+    expect(
+      reconcilePick(CATALOG, { provider: 'claude-code', modelId: 'claude-sonnet-5' }),
+    ).toBeNull();
+    // Including one on a provider the account is not connected to: the
+    // catalog listing it is what makes it selectable.
+    expect(
+      reconcilePick(CATALOG, { provider: 'openai-codex', modelId: 'gpt-5.5' }),
+    ).toBeNull();
+  });
+
+  it('never clears on an absent or empty catalog', () => {
+    // "I have not heard from the server yet" is not "that model is gone",
+    // and treating it as such would wipe a pin on every cold start.
+    const pick = { provider: 'claude-code', modelId: 'claude-sonnet-5' };
+    expect(reconcilePick(undefined, pick)).toBeNull();
+    expect(reconcilePick([], pick)).toBeNull();
+  });
+
+  it('is a no-op when nothing was ever picked', () => {
+    expect(reconcilePick(CATALOG, { provider: '', modelId: '' })).toBeNull();
+  });
+});
+
+describe('catalogHasModel', () => {
+  it('matches only within the named provider', () => {
+    expect(catalogHasModel(CATALOG, 'claude-code', 'claude-sonnet-5')).toBe(true);
+    expect(catalogHasModel(CATALOG, 'openai-codex', 'claude-sonnet-5')).toBe(false);
+  });
+
+  it('is false for an empty or missing catalog', () => {
+    expect(catalogHasModel([], 'claude-code', 'claude-sonnet-5')).toBe(false);
+    expect(catalogHasModel(undefined, 'claude-code', 'claude-sonnet-5')).toBe(false);
+  });
+});
+
+/**
+ * Finding 3: a SESSION's own pinned model outliving the catalog.
+ *
+ * `reconcilePick` covers the choice made on the home screen. This covers
+ * the other source: the model the daemon pinned to a session, read out of
+ * state.db. ThreadScreen's `effective` used it unchecked, and `effective`
+ * is what send, answer and recover all wire as `provider/modelId` -- so a
+ * model the desktop app had deleted went back out on all three. `recover`
+ * is the sharp one: it creates a NEW session, where there is no pinned
+ * model for the CLI to fall back on.
+ */
+describe('resolveThreadModel', () => {
+  const pills = {
+    provider: 'claude-code',
+    modelId: 'claude-fable-5',
+    modelLabel: 'Fable 5',
+  };
+
+  it('keeps a pinned model the catalog still lists', () => {
+    expect(
+      resolveThreadModel({
+        catalog: CATALOG,
+        pills,
+        threadModel: { provider: 'openai-codex', modelId: 'gpt-5.5', label: 'GPT-5.5' },
+        hasModelOverride: false,
+      }),
+    ).toEqual({ provider: 'openai-codex', modelId: 'gpt-5.5', modelLabel: 'GPT-5.5' });
+  });
+
+  it('falls back when the pinned model is gone from the catalog', () => {
+    // What send / answer / recover would otherwise put on the wire.
+    const got = resolveThreadModel({
+      catalog: CATALOG,
+      pills,
+      threadModel: { provider: 'openrouter', modelId: 'deleted-model', label: 'Deleted' },
+      hasModelOverride: false,
+    });
+    expect(got).toEqual(pills);
+    expect(`${got.provider}/${got.modelId}`).not.toContain('deleted-model');
+  });
+
+  it('falls back when only the model, not the provider, was removed', () => {
+    const got = resolveThreadModel({
+      catalog: CATALOG,
+      pills,
+      threadModel: { provider: 'claude-code', modelId: 'claude-opus-9' },
+      hasModelOverride: false,
+    });
+    expect(got).toEqual(pills);
+  });
+
+  it('never drops a pinned model on an absent or empty catalog', () => {
+    // "Not known yet" is not "deleted" -- the same rule reconcilePick uses.
+    const pinnedModel = { provider: 'whatever', modelId: 'some-model' };
+    for (const catalog of [undefined, []]) {
+      expect(
+        resolveThreadModel({ catalog, pills, threadModel: pinnedModel, hasModelOverride: false }),
+      ).toEqual({ provider: 'whatever', modelId: 'some-model', modelLabel: 'some-model' });
+    }
+  });
+
+  it('lets an explicit pick win over the session pin', () => {
+    expect(
+      resolveThreadModel({
+        catalog: CATALOG,
+        pills,
+        threadModel: { provider: 'openai-codex', modelId: 'gpt-5.5' },
+        hasModelOverride: true,
+      }),
+    ).toEqual(pills);
+  });
+
+  it('falls back to the pills when nothing is pinned', () => {
+    for (const threadModel of [null, undefined, { provider: '', modelId: '' }]) {
+      expect(
+        resolveThreadModel({ catalog: CATALOG, pills, threadModel, hasModelOverride: false }),
+      ).toEqual(pills);
+    }
   });
 });

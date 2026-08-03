@@ -68,6 +68,47 @@ def tg(token, method, params=None, timeout=30):
         return json.load(r)
 
 
+def detect_aside_account():
+    """The Aside account directory this machine is signed in to.
+
+    Aside numbers accounts and records the active one in
+    ~/.aside/accounts.json. Everything used to assume "u/0", which is only
+    right for someone still on their first account -- anyone on a second
+    one would have had the bridge point at an empty account and show an
+    empty session list, with nothing explaining why.
+    """
+    accounts = os.path.expanduser("~/.aside/accounts.json")
+    try:
+        with open(accounts, encoding="utf-8", errors="replace") as f:
+            parsed = json.load(f)
+        # A half-written or hand-edited accounts.json can parse to a list,
+        # a string or null, and `.get` on any of those raises
+        # AttributeError -- which is not in the handler below, so the
+        # whole wizard died with a traceback at "Checking your machine"
+        # over a file it is only consulting as a hint. Anything that is
+        # not an object simply means "no answer here".
+        current = parsed.get("currentAccountId") if isinstance(parsed, dict) \
+            else None
+        # `isinstance(True, int)` is True in Python, and u/True is not an
+        # account, so booleans are excluded explicitly.
+        if isinstance(current, int) and not isinstance(current, bool) \
+                and current >= 0:
+            return os.path.expanduser("~/.aside/u/%d" % current)
+    except (OSError, ValueError, TypeError):
+        pass
+    return os.path.expanduser("~/.aside/u/0")
+
+
+def detect_aside_paths():
+    """Sessions dir, credentials and state db for the active account."""
+    root = detect_aside_account()
+    return {
+        "sessions_dir": os.path.join(root, "sessions"),
+        "credentials_path": os.path.join(root, "credentials.json"),
+        "state_db_path": os.path.join(root, "state.db"),
+    }
+
+
 def step_checks():
     say("%s— Checking your machine —%s" % (BOLD, RESET))
     if sys.platform != "darwin":
@@ -93,6 +134,15 @@ def step_checks():
             sys.exit(1)
         cli = os.path.expanduser(custom)
     ok("Aside CLI found")
+
+    paths = detect_aside_paths()
+    if os.path.isdir(paths["sessions_dir"]):
+        ok("Aside account detected (%s)"
+           % os.path.basename(os.path.dirname(paths["sessions_dir"])))
+    else:
+        warn("no sessions directory yet at %s" % paths["sessions_dir"])
+        say("    That is normal on a brand-new Aside install; it appears")
+        say("    the first time you run a session.")
     return cli
 
 
@@ -221,9 +271,37 @@ def write_config(token, chat_id, name, style, cli):
         "chat_id": chat_id,
         "owner_name": name,
         "style": style,
-        "aside_cli": cli,
     })
-    cfg.setdefault("default_model", "claude-sonnet-5")
+
+    # Point at whichever Aside account is actually signed in -- but only
+    # where the user has not already said otherwise.
+    #
+    # This used to be an unconditional `cfg.update(detect_aside_paths())`,
+    # which silently overwrote a hand-set sessions_dir/credentials_path/
+    # state_db_path on every re-run. config.example.json invites exactly
+    # that customisation ("Only set them by hand if your install lives
+    # somewhere unusual"), and setup.py is documented as safe to re-run any
+    # time to reconfigure -- so re-running it must not undo the one thing
+    # the config file tells you it is fine to do. A missing or empty value
+    # is still filled in, which is what a new install needs.
+    for key, value in detect_aside_paths().items():
+        if not str(cfg.get(key) or "").strip():
+            cfg[key] = value
+
+    # Same rule for the CLI, with one addition: a custom path that no
+    # longer exists is repaired rather than preserved, since keeping a
+    # broken one helps nobody.
+    existing_cli = str(cfg.get("aside_cli") or "").strip()
+    if not existing_cli or not os.path.exists(
+            os.path.expanduser(existing_cli)):
+        cfg["aside_cli"] = cli
+    # Deliberately NOT pinned to a model here. An empty default means the
+    # Mini App reads the desktop app's own default live from settings.json
+    # on every request, so the phone always shows what the browser shows --
+    # and a user with no Claude access does not get a first turn aimed at
+    # a Claude model. See desktop.ts.
+    cfg.setdefault("default_model", "")
+    cfg.setdefault("default_effort", "medium")
     if persona_changed:
         drop_stale_session(cfg)
     with open(CONFIG_PATH, "w") as f:

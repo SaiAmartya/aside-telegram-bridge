@@ -8,6 +8,12 @@ state.db
 # state directory (chmod 600) rather than here, but a MINIAPP_SECRET_PATH
 # pointed inside the repo must not be able to leak it.
 miniapp-secret.json
+# Per-install Mini App state: the owner's chosen defaults and the list of
+# sessions running the soft-confirm protocol. Neither is shareable and
+# both used to be untracked-but-not-ignored, so a `git add -A` would have
+# committed them.
+miniapp-settings.json
+miniapp-soft-confirm.json
 .env
 .env.*
 
@@ -33,6 +39,10 @@ __pycache__/
 
 # --- local-only tooling, not part of the published project ---------------
 .DS_Store
+# A stray nested checkout of this same repo; never part of a release.
+/aside-telegram-bridge/
+# Scratch harness used to render the web app at phone size during review.
+miniapp/web/dist/__preview.html
 channel-guard*.py
 channel-guard*.json
 monitor-native-channel.py

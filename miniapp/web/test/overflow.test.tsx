@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render } from '@testing-library/react';
-import { Composer } from '../src/components/Composer';
+import { BottomBar, Composer } from '../src/components/Composer';
 import type { PillState } from '../src/components/Composer';
 
 afterEach(cleanup);
@@ -63,6 +63,18 @@ const pills: PillState = {
   provider: 'openrouter',
 };
 
+function renderBar() {
+  return render(
+    <BottomBar
+      permission="Guard"
+      pills={pills}
+      onOpenModel={vi.fn()}
+      onOpenPermission={vi.fn()}
+      context={{ used: 0, window: 0 }}
+    />,
+  );
+}
+
 function renderComposer() {
   return render(
     <Composer
@@ -72,7 +84,6 @@ function renderComposer() {
       onSubmit={vi.fn()}
       pills={pills}
       onOpenModel={vi.fn()}
-      onOpenEffort={vi.fn()}
       onOpenPermission={vi.fn()}
       permissionMode="guard"
       attachments={[]}
@@ -101,20 +112,79 @@ describe('the pill cannot widen the app', () => {
     expect(ruleBody(componentsCss, '.pill-effort')).toContain('flex: none');
   });
 
-  it('the long model id renders inside .pill-label, the effort pill carries .pill-effort', () => {
+  it('the composer carries exactly one pill: the model', () => {
+    // Reasoning moved into the model sheet, so the action row has a single
+    // pill to fit. That is what stopped the label ellipsising to
+    // "DeepSee…" inside a 336px card.
+    const { container } = renderComposer();
+    const found = Array.from(container.querySelectorAll('.pill'));
+    expect(found.length).toBe(1);
+    expect(found[0].classList.contains('pill-effort')).toBe(false);
+  });
+
+  it('neither surface still renders an effort pill', () => {
+    for (const { container } of [renderComposer(), renderBar()]) {
+      expect(container.querySelector('.pill-effort')).toBeNull();
+    }
+  });
+
+  it('the long model id renders inside .pill-label', () => {
+    const { container } = renderBar();
+    const labels = Array.from(container.querySelectorAll('.pill-label'));
+    // The pill drops a trailing parenthetical qualifier -- see
+    // `pillModelLabel` -- so the id renders without its "(max)" suffix.
+    // What matters here is that it is inside .pill-label, which is the
+    // element carrying the ellipsis.
+    expect(labels.map((el) => el.textContent)).toContain(
+      'oc/deepseek-v4-flash-free',
+    );
+  });
+
+  it('the composer -- the surface that actually ships -- ellipsizes too', () => {
+    /*
+     * The assertion above was the original regression test, and it now
+     * covers `BottomBar`, which nothing renders any more: the model pill
+     * moved into the composer when the bottom bar was folded away. A
+     * regression test pointed only at a component the app no longer
+     * mounts cannot catch the bug coming back, so the same contract is
+     * pinned on the surface a user sees.
+     */
     const { container } = renderComposer();
     const labels = Array.from(container.querySelectorAll('.pill-label'));
-    expect(labels.map((el) => el.textContent)).toContain(LONG_MODEL);
-
-    const effort = Array.from(container.querySelectorAll('.pill')).find((el) =>
-      el.textContent?.includes('High'),
+    expect(labels.map((el) => el.textContent)).toContain(
+      'oc/deepseek-v4-flash-free',
     );
-    expect(effort?.classList.contains('pill-effort')).toBe(true);
+    // And the label sits inside a pill that is allowed to shrink.
+    const pill = container.querySelector('.pill');
+    expect(pill?.querySelector('.pill-label')).not.toBeNull();
+    expect(pill?.classList.contains('pill-effort')).toBe(false);
+  });
+});
 
-    const model = Array.from(container.querySelectorAll('.pill')).find((el) =>
-      el.textContent?.includes(LONG_MODEL),
+describe('the thread footer keeps the gradient it was given', () => {
+  it('has no leftover @supports rule repainting it flat', () => {
+    /*
+     * `.thread-footer` used to be a blurred bar, with an
+     * `@supports not (backdrop-filter: blur(1px))` fallback painting it
+     * opaque. The footer became a color-mix gradient -- with a solid
+     * `var(--page)` first declaration as its own fallback -- but the
+     * @supports rule stayed, so on the webviews it claimed to help
+     * (older WebKit, which needs `-webkit-backdrop-filter` and therefore
+     * fails the query) it overwrote the gradient with a flat, differently
+     * coloured block.
+     */
+    const bare = componentsCss.replace(/\/\*[\s\S]*?\*\//g, '');
+    const supports = bare.match(
+      /@supports[^{]*backdrop-filter[^{]*\{[\s\S]*?\}\s*\}/g,
     );
-    expect(model?.classList.contains('pill-effort')).toBe(false);
+    for (const rule of supports || []) {
+      expect(rule).not.toContain('.thread-footer');
+    }
+    // The footer still carries a solid fallback ahead of the gradient, so
+    // a webview without color-mix gets a page-coloured bar, not nothing.
+    const footer = ruleBody(componentsCss, '.thread-footer');
+    expect(footer).toContain('background: var(--page)');
+    expect(footer).toContain('linear-gradient');
   });
 });
 

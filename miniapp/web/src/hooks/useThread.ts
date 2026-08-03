@@ -20,6 +20,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TranscriptSocket, api } from '../api';
+import { threadErrorText } from '../utils/format';
 import type {
   Attachment,
   ChildSession,
@@ -192,7 +193,7 @@ export function useThread(sessionId: string): ThreadState {
       setError(null);
     } catch (err) {
       if (!alive.current) return;
-      setError((err as Error).message);
+      setError(threadErrorText(err));
     } finally {
       if (alive.current) setLoading(false);
     }
