@@ -25,7 +25,7 @@ import type { CitationMark } from './utils/citations';
 import { api, setAuthToken } from './api';
 import { useThread } from './hooks/useThread';
 import { useAttachments } from './hooks/useAttachments';
-import { resolvePills } from './utils/pills';
+import { reconcilePick, resolvePills, resolveThreadModel } from './utils/pills';
 import {
   applyTheme,
   backButton,
@@ -35,7 +35,7 @@ import {
   readInitData,
   stashDevInitData,
 } from './telegram';
-import type { SessionRow, StatusResponse } from './types';
+import type { CatalogProvider, SessionRow, StatusResponse } from './types';
 
 /**
  * A thread on the navigation stack.
@@ -170,11 +170,37 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * Re-read the catalog and the daemon's default.
+   *
+   * The server rebuilds its catalog from the desktop app's own
+   * models.json/settings.json on a 5s TTL, but the client used to fetch
+   * `/status` exactly once at launch -- so every one of those refreshes
+   * was invisible to the phone, which kept offering models the desktop had
+   * deleted and kept showing a default the desktop had changed. A Mini App
+   * webview is routinely left open for days.
+   */
+  const refreshStatus = useCallback(async () => {
+    try {
+      setStatus(await api.status());
+    } catch {
+      // Keep whatever we last knew rather than blanking the pickers.
+    }
+  }, []);
+
   useEffect(() => {
     if (auth.phase !== 'ready') return;
     void loadSessions();
-    api.status().then(setStatus, () => {});
-  }, [auth.phase, loadSessions]);
+    void refreshStatus();
+  }, [auth.phase, loadSessions, refreshStatus]);
+
+  // A bounded refresh, so a long-lived webview converges on the desktop's
+  // current model list without anyone reopening the app.
+  useEffect(() => {
+    if (auth.phase !== 'ready') return undefined;
+    const timer = window.setInterval(refreshStatus, 60_000);
+    return () => window.clearInterval(timer);
+  }, [auth.phase, refreshStatus]);
 
   // --- navigation ---------------------------------------------------------
   const screen = stack[stack.length - 1] as ThreadScreenState | undefined;
@@ -217,6 +243,23 @@ export default function App() {
    * browser would use. The precedence lives in `resolvePills`, which is
    * tested directly.
    */
+  /**
+   * Drop a stored pick the desktop no longer offers.
+   *
+   * Runs on every status refresh, so a model deleted in the desktop app
+   * stops being selected — and stops being SENT — within one refresh
+   * rather than never. A pick the catalog still lists is left exactly
+   * alone: pinning a model on purpose has to survive this.
+   */
+  useEffect(() => {
+    const next = reconcilePick(status?.catalog, { provider, modelId });
+    if (!next) return;
+    setProvider(next.provider);
+    setModelId(next.modelId);
+    localStorage.removeItem(PROVIDER_KEY);
+    localStorage.removeItem(MODEL_KEY);
+  }, [status, provider, modelId]);
+
   const pills = useMemo(
     () => resolvePills(status, { provider, modelId, effort }),
     [status, provider, modelId, effort],
@@ -288,7 +331,14 @@ export default function App() {
     );
   }
 
-  const openModel = (anchor: HTMLElement) => setPicker({ kind: 'model', anchor });
+  const openModel = (anchor: HTMLElement) => {
+    // Opening the picker is the moment the list on screen has to be the
+    // list the desktop actually has. The sheet renders from whatever
+    // `status` holds now and re-renders when this lands, so there is no
+    // spinner and no wait.
+    void refreshStatus();
+    setPicker({ kind: 'model', anchor });
+  };
   const openPermission = (anchor: HTMLElement) =>
     setPicker({ kind: 'permission', anchor });
   const closePicker = () => setPicker({ kind: 'none' });
@@ -440,6 +490,7 @@ export default function App() {
       // Whether the user has actively chosen; when they have not, the
       // thread shows the session's own model rather than the account
       // default, which is a different thing.
+      catalog={status?.catalog}
       hasModelOverride={Boolean(modelId)}
       hasEffortOverride={Boolean(effort)}
       draft={draft}
@@ -459,6 +510,7 @@ function ThreadScreen({
   onInspectSubagent,
   onOpenRecovered,
   pills,
+  catalog,
   hasModelOverride,
   hasEffortOverride,
   draft,
@@ -483,6 +535,7 @@ function ThreadScreen({
     effortLabel: string;
     effortId: string;
   };
+  catalog?: CatalogProvider[];
   hasModelOverride: boolean;
   hasEffortOverride: boolean;
   draft: string;
@@ -515,16 +568,14 @@ function ThreadScreen({
    * is the one that was missing -- the bar used to show the account
    * default on every session regardless of what it was really using.
    */
+  const chosen = resolveThreadModel({
+    catalog,
+    pills,
+    threadModel: thread.model,
+    hasModelOverride,
+  });
   const effective = {
-    provider: hasModelOverride
-      ? pills.provider
-      : thread.model?.provider || pills.provider,
-    modelId: hasModelOverride
-      ? pills.modelId
-      : thread.model?.modelId || pills.modelId,
-    modelLabel: hasModelOverride
-      ? pills.modelLabel
-      : thread.model?.label || pills.modelLabel,
+    ...chosen,
     effortId: hasEffortOverride
       ? pills.effortId
       : thread.model?.effort || pills.effortId,

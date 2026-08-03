@@ -356,7 +356,16 @@ def find_tunnel_url(log_paths, attempts=30):
     for _ in range(attempts):
         for path in log_paths:
             try:
-                with open(path) as fh:
+                # The server log carries cloudflared's own stdout/stderr
+                # verbatim, and this reads it while both are still being
+                # written -- so a read routinely lands mid-character, and
+                # strict decoding raises UnicodeDecodeError. That is a
+                # ValueError, not an OSError, so it escaped the handler
+                # below and ended the setup wizard with a traceback at the
+                # very last step, after the multi-minute build. Replacing
+                # the bad bytes costs nothing: the hostname this is
+                # looking for is ASCII.
+                with open(path, encoding="utf-8", errors="replace") as fh:
                     for line in reversed(fh.read().splitlines()):
                         for m in _TUNNEL_RE.finditer(line):
                             url = m.group(0)

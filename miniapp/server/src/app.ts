@@ -52,7 +52,7 @@ import {
   MAX_LOCAL_IMAGE_BYTES,
   localFileRoots,
   localFileStatus,
-  resolveLocalFile,
+  openLocalFile,
 } from './localfiles.js';
 import {
   PERMISSION_MENU,
@@ -76,7 +76,7 @@ import {
 import { TokenError, bearerFrom, mintToken, verifyToken } from './auth.js';
 import { parseTranscript } from './transcript.js';
 import { buildThread } from './thread.js';
-import { readHistory } from './jsonl.js';
+import { readHistory, transcriptTooLarge } from './jsonl.js';
 import {
   firstUserText,
   isMobileSession,
@@ -450,6 +450,20 @@ export async function buildServer(
         return reply.code(404).send({ error: 'session_not_found' });
       }
 
+      /*
+       * Say so, rather than serving an empty conversation.
+       *
+       * `readHistory` refuses a transcript past the cap and returns an
+       * empty list -- which is correct as a memory guard and a lie as an
+       * answer: the thread rendered as a chat with nothing in it, 200 OK,
+       * with no way to tell that from a genuinely empty session. This is
+       * the same 413 `/messages` already gives, and the client already
+       * turns it into "This chat is too long to open on your phone."
+       */
+      if (transcriptTooLarge(msgFile, MAX_TRANSCRIPT_BYTES)) {
+        return reply.code(413).send({ error: 'transcript_too_large' });
+      }
+
       const session = await fetchSession(facade, id).catch(() => null);
       const running = runner.isBusy(id) || session?.status === 'running';
       // A thread open is the one place worth paying for a fresh child read
@@ -659,27 +673,57 @@ export async function buildServer(
 
       // The agent owns this directory and may be rewriting it right now, so
       // the file can disappear between the resolve above and this stat. That
-      // is a 404, not an unhandled throw turning into a 500.
+      // is a 404, not an unhandled throw turning into a 500. The isFile
+      // check also has to come BEFORE any open: opening a fifo blocks.
       const stat = fs.statSync(file, { throwIfNoEntry: false });
       if (!stat?.isFile()) {
         return reply.code(404).send({ error: 'file_not_found' });
       }
-      if (stat.size > MAX_ARTIFACT_BYTES) {
-        return reply.code(413).send({ error: 'file_too_large' });
-      }
 
       /*
-       * The agent owns this directory and may be rewriting it right now,
-       * so the file can vanish between the stat above and the open below.
-       * Unguarded, that ENOENT surfaced as an unhandled 500; a file that
-       * has just been deleted is a 404.
+       * Open by descriptor, and answer off the descriptor.
+       *
+       * The window this closes is the one between the stat above and the
+       * first byte read: the agent can unlink or truncate the file in it.
+       * `fs.createReadStream(path)` cannot report that -- it opens
+       * asynchronously and reports ENOENT as an `error` EVENT, so a
+       * try/catch around it never fires and the handler had already sent
+       * 200 plus artifact headers by the time the failure arrived. The
+       * client got a successful, empty, correctly-typed response for a
+       * file that was not there.
+       *
+       * `openSync` throws where it can be turned into a 404, and once the
+       * descriptor is held the bytes behind it are stable no matter what
+       * happens to the path -- so the size check below is also being
+       * applied to the same file that is about to be sent, rather than to
+       * whatever the name pointed at a moment ago.
        */
-      let stream: fs.ReadStream;
+      let fd: number;
       try {
-        stream = fs.createReadStream(file);
+        fd = fs.openSync(file, 'r');
       } catch {
         return reply.code(404).send({ error: 'file_not_found' });
       }
+
+      let opened: fs.Stats;
+      try {
+        opened = fs.fstatSync(fd);
+      } catch {
+        fs.closeSync(fd);
+        return reply.code(404).send({ error: 'file_not_found' });
+      }
+      if (!opened.isFile()) {
+        fs.closeSync(fd);
+        return reply.code(404).send({ error: 'file_not_found' });
+      }
+      if (opened.size > MAX_ARTIFACT_BYTES) {
+        fs.closeSync(fd);
+        return reply.code(413).send({ error: 'file_too_large' });
+      }
+
+      const stream = fs.createReadStream(file, { fd, autoClose: true });
+      // A read error after the headers are out cannot become a status
+      // code, but it must not become an unhandled 'error' event either.
       stream.on('error', () => stream.destroy());
 
       return reply
@@ -727,12 +771,29 @@ export async function buildServer(
         uploadsDir,
         mediaDir: config.mediaDir,
       });
-      const found = resolveLocalFile(roots, query.path, MAX_LOCAL_IMAGE_BYTES);
+      /*
+       * Resolve AND open together -- see `openLocalFile`.
+       *
+       * Containment, content type and the 10 MiB cap used to be decided
+       * from the PATH and then a separate open streamed whatever the name
+       * meant by that point. `openLocalFile` opens with `O_NOFOLLOW` and
+       * re-checks "regular file" and the size cap on the DESCRIPTOR, so
+       * the bytes that were measured are the bytes that go out.
+       */
+      const found = openLocalFile(roots, query.path, MAX_LOCAL_IMAGE_BYTES);
       if (!found.ok) {
         return reply
           .code(localFileStatus(found.reason))
           .send({ error: found.reason });
       }
+
+      const stream = fs.createReadStream(found.file, {
+        fd: found.fd,
+        autoClose: true,
+      });
+      // A read error past the headers cannot become a status code, but it
+      // must not become an unhandled 'error' event either.
+      stream.on('error', () => stream.destroy());
 
       return reply
         .header('content-type', found.contentType)
@@ -741,7 +802,7 @@ export async function buildServer(
         // and must never be treated as markup for our own origin.
         .header('content-security-policy', "sandbox; default-src 'none'")
         .header('x-content-type-options', 'nosniff')
-        .send(fs.createReadStream(found.file));
+        .send(stream);
     },
   );
 

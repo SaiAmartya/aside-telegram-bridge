@@ -1,9 +1,9 @@
 #!/bin/bash
 # aside-telegram-bridge one-line installer
-#   curl -fsSL https://raw.githubusercontent.com/Parthkkk/aside-telegram-bridge/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/SaiAmartya/aside-telegram-bridge/main/install.sh | bash
 set -euo pipefail
 
-REPO="https://github.com/Parthkkk/aside-telegram-bridge"
+REPO="https://github.com/SaiAmartya/aside-telegram-bridge"
 DEST="${ASIDE_BRIDGE_DIR:-$HOME/aside-telegram-bridge}"
 
 if [ "$(uname)" != "Darwin" ]; then

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { buildServer } from './app.js';
 import { loadConfig, loadOrCreateJwtSecret } from './config.js';
 import { MenuSync, Tunnel, defaultBinDir } from './tunnel.js';
+import { makeCrashHandler, makeSignalHandler } from './shutdown.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -99,19 +100,44 @@ async function main(): Promise<void> {
     );
   });
 
-  process.on('uncaughtException', (err) => {
-    app.log.error({ err }, 'uncaught exception');
-  });
+  /**
+   * A crash must still be a crash.
+   *
+   * An `uncaughtException` listener SUPPRESSES Node's default termination,
+   * so logging and returning left the process alive in a state nobody can
+   * reason about -- half-torn state, a listener that never fired, a
+   * connection pool that will never drain -- while launchd's KeepAlive,
+   * which only replaces a process that has actually exited, saw a healthy
+   * service and did nothing. A wedged server that answers nothing is worse
+   * than a restarted one.
+   *
+   * So: log it, give the tunnel and the HTTP server a bounded moment to
+   * come down cleanly, and then exit non-zero regardless. This differs
+   * from `unhandledRejection` above on purpose -- a dropped background
+   * promise is recoverable, an exception that escaped every frame is not.
+   */
+  const stopSupervisors = () => {
+    tunnel?.stop();
+    menu?.stop();
+  };
+  const close = () => app.close();
+  const exit = (code: number) => process.exit(code);
 
+  process.on(
+    'uncaughtException',
+    makeCrashHandler({
+      logFatal: (err) => app.log.fatal({ err }, 'uncaught exception; exiting'),
+      stopSupervisors,
+      close,
+      exit,
+    }),
+  );
+
+  // One handler instance across both signals, so SIGINT then SIGTERM is
+  // still a single shutdown.
+  const onSignal = makeSignalHandler({ stopSupervisors, close, exit });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, () => {
-      tunnel?.stop();
-      menu?.stop();
-      app.close().then(
-        () => process.exit(0),
-        () => process.exit(1),
-      );
-    });
+    process.on(signal, onSignal);
   }
 }
 

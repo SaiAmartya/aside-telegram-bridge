@@ -79,9 +79,20 @@ def detect_aside_account():
     """
     accounts = os.path.expanduser("~/.aside/accounts.json")
     try:
-        with open(accounts) as f:
-            current = json.load(f).get("currentAccountId")
-        if isinstance(current, int) and current >= 0:
+        with open(accounts, encoding="utf-8", errors="replace") as f:
+            parsed = json.load(f)
+        # A half-written or hand-edited accounts.json can parse to a list,
+        # a string or null, and `.get` on any of those raises
+        # AttributeError -- which is not in the handler below, so the
+        # whole wizard died with a traceback at "Checking your machine"
+        # over a file it is only consulting as a hint. Anything that is
+        # not an object simply means "no answer here".
+        current = parsed.get("currentAccountId") if isinstance(parsed, dict) \
+            else None
+        # `isinstance(True, int)` is True in Python, and u/True is not an
+        # account, so booleans are excluded explicitly.
+        if isinstance(current, int) and not isinstance(current, bool) \
+                and current >= 0:
             return os.path.expanduser("~/.aside/u/%d" % current)
     except (OSError, ValueError, TypeError):
         pass
@@ -260,11 +271,30 @@ def write_config(token, chat_id, name, style, cli):
         "chat_id": chat_id,
         "owner_name": name,
         "style": style,
-        "aside_cli": cli,
     })
-    # Point at whichever Aside account is actually signed in, rather than
-    # letting the server fall back to a guess.
-    cfg.update(detect_aside_paths())
+
+    # Point at whichever Aside account is actually signed in -- but only
+    # where the user has not already said otherwise.
+    #
+    # This used to be an unconditional `cfg.update(detect_aside_paths())`,
+    # which silently overwrote a hand-set sessions_dir/credentials_path/
+    # state_db_path on every re-run. config.example.json invites exactly
+    # that customisation ("Only set them by hand if your install lives
+    # somewhere unusual"), and setup.py is documented as safe to re-run any
+    # time to reconfigure -- so re-running it must not undo the one thing
+    # the config file tells you it is fine to do. A missing or empty value
+    # is still filled in, which is what a new install needs.
+    for key, value in detect_aside_paths().items():
+        if not str(cfg.get(key) or "").strip():
+            cfg[key] = value
+
+    # Same rule for the CLI, with one addition: a custom path that no
+    # longer exists is repaired rather than preserved, since keeping a
+    # broken one helps nobody.
+    existing_cli = str(cfg.get("aside_cli") or "").strip()
+    if not existing_cli or not os.path.exists(
+            os.path.expanduser(existing_cli)):
+        cfg["aside_cli"] = cli
     # Deliberately NOT pinned to a model here. An empty default means the
     # Mini App reads the desktop app's own default live from settings.json
     # on every request, so the phone always shows what the browser shows --

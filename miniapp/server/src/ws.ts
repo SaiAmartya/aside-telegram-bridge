@@ -89,12 +89,12 @@ const NEW_SESSION_POLL_MS = 250;
 /**
  * How long a socket may stay connected without proving who it is.
  *
- * The upgrade handler is a raw `server.on('upgrade')` listener, so it sits
- * outside Fastify's routing and outside @fastify/rate-limit entirely.
- * Before this, a client that connected with no `?token=` and then simply
- * said nothing was accepted and held open forever -- 200 of them in a
- * second, each registering four listeners on the runner's event emitters.
- * Verified against this server. A socket now proves itself or is dropped.
+ * Now a backstop rather than the gate: the upgrade handler below verifies
+ * the token BEFORE the handshake, so a connection that reaches this point
+ * is already authenticated. It is kept because it costs nothing and it
+ * keeps the in-band `{type:"auth"}` branch of the documented protocol
+ * honest -- if the upgrade gate is ever relaxed, an anonymous socket is
+ * still dropped rather than held open forever.
  */
 const AUTH_DEADLINE_MS = 5_000;
 
@@ -105,6 +105,36 @@ const AUTH_DEADLINE_MS = 5_000;
  * from the public tunnel, not a limit anyone should ever meet.
  */
 const MAX_CLIENTS = 32;
+
+/**
+ * Ceiling on a single incoming frame.
+ *
+ * Every client->server message in the protocol at the top of this file is
+ * a handful of fields: a type, a token, a session id. `ws` defaults to
+ * 100 MiB, so before this a public tunnel would happily buffer a 100 MB
+ * frame into memory and then hand it to `JSON.parse` -- which is a second
+ * copy and a full parse of attacker-chosen bytes, from one socket, with no
+ * further authentication needed beyond a token. 64 KiB is ~300x the
+ * largest legitimate frame and still small enough to be uninteresting.
+ */
+const MAX_PAYLOAD_BYTES = 64 * 1024;
+
+/**
+ * Failed-upgrade budget, per remote address.
+ *
+ * Counts only FAILURES, and -- since everything arrives from cloudflared
+ * on one loopback address -- is consulted only AFTER a token has failed to
+ * verify. Both halves are load-bearing: counting failures alone still let
+ * an attacker's twenty bad tokens fill the single shared bucket and lock
+ * the owner out, because the check ran before the signature did. A proven
+ * owner now bypasses the budget and empties it.
+ *
+ * The window is short because the only legitimate source of a failure is
+ * an expired token, which the client replaces by re-authenticating over
+ * HTTP.
+ */
+const UPGRADE_FAIL_LIMIT = 20;
+const UPGRADE_FAIL_WINDOW_MS = 60_000;
 
 interface Deps {
   app: FastifyInstance;
@@ -118,7 +148,46 @@ interface Deps {
 
 export function attachWebSocket(deps: Deps): WebSocketServer {
   const { app, config, runner, watchers, threads, subagents, jwtSecret } = deps;
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_PAYLOAD_BYTES,
+  });
+
+  /** Recent failed upgrades, per remote address. See UPGRADE_FAIL_LIMIT. */
+  const upgradeFailures = new Map<string, number[]>();
+
+  function noteUpgradeFailure(key: string): void {
+    const now = Date.now();
+    const recent = (upgradeFailures.get(key) || []).filter(
+      (at) => now - at < UPGRADE_FAIL_WINDOW_MS,
+    );
+    recent.push(now);
+    upgradeFailures.set(key, recent);
+    // The map is keyed by peer and everything arrives from cloudflared on
+    // loopback, so it stays tiny -- but a direct-LAN deployment must not
+    // let it grow without bound either.
+    if (upgradeFailures.size > 64) {
+      for (const [peer, times] of upgradeFailures) {
+        if (!times.some((at) => now - at < UPGRADE_FAIL_WINDOW_MS)) {
+          upgradeFailures.delete(peer);
+        }
+      }
+    }
+  }
+
+  /** A proven owner clears the bucket: it was never describing them. */
+  function clearUpgradeFailures(key: string): void {
+    upgradeFailures.delete(key);
+  }
+
+  function upgradeThrottled(key: string): boolean {
+    const now = Date.now();
+    const recent = (upgradeFailures.get(key) || []).filter(
+      (at) => now - at < UPGRADE_FAIL_WINDOW_MS,
+    );
+    if (recent.length) upgradeFailures.set(key, recent);
+    return recent.length >= UPGRADE_FAIL_LIMIT;
+  }
 
   // Each connection registers four listeners across these two emitters, so
   // the default ceiling of 10 trips a spurious "possible memory leak"
@@ -126,7 +195,29 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
   runner.setMaxListeners(MAX_CLIENTS + 10);
   subagents.setMaxListeners(MAX_CLIENTS + 10);
 
+  /*
+   * Authenticate BEFORE the handshake, not after it.
+   *
+   * This endpoint is the one thing the public tunnel exposes that is not
+   * behind Fastify's routing or its rate limiter. Accepting first and
+   * checking later meant an anonymous request took a slot out of the
+   * global pool of MAX_CLIENTS and held it for AUTH_DEADLINE_MS -- so 32
+   * tokenless connections every five seconds, which any script can manage,
+   * kept the owner's own phone getting 503 indefinitely. Verifying the
+   * token here means an unauthenticated peer never becomes a client at
+   * all: no slot, no listeners, no timer, no frames read.
+   *
+   * The token stays out of every log line: only `url.pathname` is ever
+   * logged, never `request.url`, which carries `?token=`.
+   */
   app.server.on('upgrade', (request, socket, head) => {
+    const peer = request.socket.remoteAddress || 'unknown';
+    const refuse = (status: string, countsAsFailure = true) => {
+      if (countsAsFailure) noteUpgradeFailure(peer);
+      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+      socket.destroy();
+    };
+
     let url: URL;
     try {
       url = new URL(request.url || '/', 'http://localhost');
@@ -138,16 +229,64 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
       socket.destroy();
       return;
     }
-    // Refuse rather than accept-then-drop: a socket that never completes
-    // the handshake costs nothing, and this is the only gate in front of an
-    // endpoint the tunnel exposes publicly.
-    if (wss.clients.size >= MAX_CLIENTS) {
-      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
-      socket.destroy();
+
+    /*
+     * Verify FIRST, throttle second.
+     *
+     * The throttle used to run ahead of `verifyToken`, and every request
+     * arrives from cloudflared on loopback -- so there is exactly one
+     * bucket, shared by the attacker and the owner. Twenty bad tokens from
+     * anywhere on the internet therefore locked the owner's own phone out
+     * of its own Mini App for the rest of the window: the thing the limit
+     * was added to prevent, caused by the limit.
+     *
+     * A valid signature is proof of ownership, so it is checked first and
+     * bypasses the budget entirely. The budget still exists and still
+     * counts, but it now only ever gates requests that FAILED -- which is
+     * the only traffic it was ever meant to describe.
+     *
+     * This does not reopen the slot or payload attacks: an unauthenticated
+     * peer is still refused before `handleUpgrade`, so it never becomes a
+     * client, and the frame cap below is unchanged. The cost a throttled
+     * flood can still buy is one HS256 verification per attempt, which is
+     * microseconds against a bounded-length token.
+     */
+    const token = url.searchParams.get('token');
+    let authed = false;
+    try {
+      verifyToken(token || undefined, jwtSecret, config.allowedUserId);
+      authed = true;
+      clearUpgradeFailures(peer);
+    } catch {
+      authed = false;
+    }
+
+    if (!authed) {
+      if (upgradeThrottled(peer)) {
+        // Past the failure budget: refuse without counting it again, so a
+        // sustained flood cannot extend its own window indefinitely.
+        refuse('429 Too Many Requests', false);
+        return;
+      }
+      app.log.warn(
+        { path: url.pathname },
+        'websocket upgrade refused: bad or missing token',
+      );
+      refuse('401 Unauthorized');
       return;
     }
+
+    // Refuse rather than accept-then-drop: a socket that never completes
+    // the handshake costs nothing, and this is the only gate in front of an
+    // endpoint the tunnel exposes publicly. Checked AFTER auth so a flood
+    // of anonymous sockets can no longer deny the pool to the real client.
+    if (wss.clients.size >= MAX_CLIENTS) {
+      refuse('503 Service Unavailable', false);
+      return;
+    }
+
     wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request, url.searchParams.get('token'));
+      wss.emit('connection', ws, request, token);
     });
   });
 

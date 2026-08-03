@@ -139,6 +139,53 @@ describe('the pill cannot widen the app', () => {
       'oc/deepseek-v4-flash-free',
     );
   });
+
+  it('the composer -- the surface that actually ships -- ellipsizes too', () => {
+    /*
+     * The assertion above was the original regression test, and it now
+     * covers `BottomBar`, which nothing renders any more: the model pill
+     * moved into the composer when the bottom bar was folded away. A
+     * regression test pointed only at a component the app no longer
+     * mounts cannot catch the bug coming back, so the same contract is
+     * pinned on the surface a user sees.
+     */
+    const { container } = renderComposer();
+    const labels = Array.from(container.querySelectorAll('.pill-label'));
+    expect(labels.map((el) => el.textContent)).toContain(
+      'oc/deepseek-v4-flash-free',
+    );
+    // And the label sits inside a pill that is allowed to shrink.
+    const pill = container.querySelector('.pill');
+    expect(pill?.querySelector('.pill-label')).not.toBeNull();
+    expect(pill?.classList.contains('pill-effort')).toBe(false);
+  });
+});
+
+describe('the thread footer keeps the gradient it was given', () => {
+  it('has no leftover @supports rule repainting it flat', () => {
+    /*
+     * `.thread-footer` used to be a blurred bar, with an
+     * `@supports not (backdrop-filter: blur(1px))` fallback painting it
+     * opaque. The footer became a color-mix gradient -- with a solid
+     * `var(--page)` first declaration as its own fallback -- but the
+     * @supports rule stayed, so on the webviews it claimed to help
+     * (older WebKit, which needs `-webkit-backdrop-filter` and therefore
+     * fails the query) it overwrote the gradient with a flat, differently
+     * coloured block.
+     */
+    const bare = componentsCss.replace(/\/\*[\s\S]*?\*\//g, '');
+    const supports = bare.match(
+      /@supports[^{]*backdrop-filter[^{]*\{[\s\S]*?\}\s*\}/g,
+    );
+    for (const rule of supports || []) {
+      expect(rule).not.toContain('.thread-footer');
+    }
+    // The footer still carries a solid fallback ahead of the gradient, so
+    // a webview without color-mix gets a page-coloured bar, not nothing.
+    const footer = ruleBody(componentsCss, '.thread-footer');
+    expect(footer).toContain('background: var(--page)');
+    expect(footer).toContain('linear-gradient');
+  });
 });
 
 describe('the root clamps horizontal panning', () => {

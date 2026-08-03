@@ -117,6 +117,29 @@ export interface TunnelAsset {
 }
 
 /**
+ * What the downloaded binary is called on disk.
+ *
+ * Windows will not execute a file without an executable extension, and
+ * `assetFor` already selects a `.exe` there -- so writing it out as a
+ * bare `cloudflared` produced a file that verified, chmod'd and then
+ * failed at spawn with ENOENT, on the one platform the Windows support
+ * was added for.
+ */
+export function cloudflaredBinaryName(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+}
+
+/** The verified binary's path inside `binDir`, for this platform. */
+export function cloudflaredBinaryPath(
+  binDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return path.join(binDir, cloudflaredBinaryName(platform));
+}
+
+/**
  * Which release asset this machine needs.
  *
  * Exported so the platform matrix is testable without downloading
@@ -192,6 +215,16 @@ export interface TunnelOptions {
   onHealthy?: (url: string) => void;
   /** Injected in tests. */
   fetchFn?: typeof fetch;
+  /**
+   * Base backoff between attempts to ACQUIRE the binary at startup.
+   *
+   * Distinct from the restart backoff: acquiring can fail for minutes
+   * (no network yet on a machine that just booted), and giving up on it
+   * is what left the tunnel permanently down. Defaults to 5s, doubling to
+   * a 60s ceiling. 0 disables the retry, which is only ever what a test
+   * wants.
+   */
+  startRetryMs?: number;
 }
 
 /**
@@ -278,6 +311,118 @@ function markerPath(binDir: string): string {
   return path.join(binDir, 'cloudflared.verified.json');
 }
 
+/** What the marker records about the file that was written next to it. */
+interface VerifiedMarker {
+  tag: string;
+  asset: string;
+  sha256: string;
+}
+
+function readMarker(binDir: string): VerifiedMarker | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(markerPath(binDir), 'utf8'));
+    return {
+      tag: String(raw.tag || ''),
+      asset: String(raw.asset || ''),
+      sha256: String(raw.sha256 || ''),
+    };
+  } catch {
+    // pre-M-6 install: no marker was ever written
+    return null;
+  }
+}
+
+/** True when this platform cares about the executable bit at all. */
+function needsExecutableBit(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32';
+}
+
+/** True when `file`'s mode lets somebody execute it. */
+export function isExecutableFile(file: string): boolean {
+  if (!needsExecutableBit()) return fs.existsSync(file);
+  const stat = fs.statSync(file, { throwIfNoEntry: false });
+  return Boolean(stat?.isFile() && (stat.mode & 0o111) !== 0);
+}
+
+/**
+ * Move a managed binary out of the way so the next attempt re-downloads.
+ *
+ * Renamed rather than unlinked: whatever was there was executed (or was
+ * meant to be), and if this ever fires on something that was actually
+ * fine, the bytes are still on disk to look at. The marker goes with it,
+ * because a marker describing a file that is no longer there is worse
+ * than no marker.
+ *
+ * ONLY ever called for `binDir`, which is this app's own state directory.
+ * A user-supplied `cloudflared_path` never reaches here: `Tunnel.acquire`
+ * returns it before `ensureCloudflared` is called, precisely so that
+ * nothing in this file can rename or delete a binary somebody else owns.
+ */
+function quarantine(target: string, binDir: string, log: (m: string) => void): void {
+  const moved = `${target}.corrupt`;
+  try {
+    fs.rmSync(moved, { force: true });
+    fs.renameSync(target, moved);
+    log(`quarantined the unusable cloudflared at ${moved}`);
+  } catch {
+    // Rename failed (read-only dir, races). Removing it is still better
+    // than looping on a binary that cannot run.
+    try {
+      fs.rmSync(target, { force: true });
+    } catch {
+      // Nothing else to try; the download below will fail loudly.
+    }
+  }
+  try {
+    fs.rmSync(markerPath(binDir), { force: true });
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * Whether the managed binary already on disk is still usable.
+ *
+ * Returns a reason string when it is not, or null when it is fine. Both
+ * halves matter and they fail differently: a truncated or swapped file
+ * hashes wrong, and a file that lost its executable bit hashes RIGHT and
+ * still cannot be spawned.
+ */
+export function managedBinaryFault(
+  target: string,
+  binDir: string,
+): string | null {
+  const marker = readMarker(binDir);
+  const { assets } = pinnedRelease();
+  // Prefer the digest the file was actually verified against; fall back
+  // to the current pin's digest for this platform's asset.
+  let expected = marker?.sha256 || '';
+  if (!expected) {
+    try {
+      expected = assets[assetFor().asset] || '';
+    } catch {
+      expected = '';
+    }
+  }
+  if (expected) {
+    let actual = '';
+    try {
+      actual = sha256File(target);
+    } catch (err) {
+      return `unreadable (${(err as Error).message})`;
+    }
+    if (actual !== expected) {
+      // With no marker this could equally be a legitimately older build,
+      // so only a MARKED file is called corrupt on digest alone.
+      if (marker?.sha256) return `checksum ${actual} does not match ${expected}`;
+    }
+  }
+  if (needsExecutableBit() && !isExecutableFile(target)) {
+    return 'not executable';
+  }
+  return null;
+}
+
 /**
  * Ensure a verified binary exists at `binDir/cloudflared`.
  *
@@ -295,35 +440,68 @@ function markerPath(binDir: string): string {
  * on disk was verified against the pin that was current when it landed,
  * and silently replacing a working tunnel binary on upgrade is a worse
  * failure mode than running a slightly older cloudflared.
+ *
+ * `revalidate` is what makes the supervisor's re-acquisition real. Without
+ * it this function returned ANY existing file untouched -- so the
+ * re-acquire path that exists to repair a broken binary handed the broken
+ * binary straight back, and the tunnel cycled on it forever. The
+ * supervisor sets it after a run that never produced a hostname, which is
+ * the one moment "what is on disk does not work" is known to be true; at
+ * that point the file is checked against its recorded digest and its
+ * executable bit, and anything that fails is quarantined and re-fetched.
+ * Boot stays lenient, so an ordinary start never pays for a 40MB download
+ * it does not need.
  */
 export async function ensureCloudflared(
   binDir: string,
   log: (m: string) => void = () => {},
+  opts: { revalidate?: boolean } = {},
 ): Promise<string> {
-  const target = path.join(binDir, 'cloudflared');
+  const target = cloudflaredBinaryPath(binDir);
   const { tag, assets } = pinnedRelease();
 
   if (fs.existsSync(target)) {
-    let verifiedTag = '';
-    try {
-      verifiedTag = String(
-        JSON.parse(fs.readFileSync(markerPath(binDir), 'utf8')).tag || '',
-      );
-    } catch {
-      // pre-M-6 install: no marker was ever written
+    const marker = readMarker(binDir);
+    const verifiedTag = marker?.tag || '';
+
+    if (opts.revalidate) {
+      const fault = managedBinaryFault(target, binDir);
+      if (fault) {
+        log(`cloudflared at ${target} is unusable: ${fault}`);
+        // A lost executable bit is ours to put back -- this is our own
+        // file in our own state directory, and a 40MB download to fix a
+        // mode is the wrong trade.
+        if (fault === 'not executable') {
+          try {
+            fs.chmodSync(target, 0o755);
+          } catch {
+            // fall through to quarantine
+          }
+        }
+        if (managedBinaryFault(target, binDir)) {
+          quarantine(target, binDir, log);
+          // Fall through to the download path below.
+        } else {
+          log('restored the executable bit on cloudflared');
+          return target;
+        }
+      } else {
+        return target;
+      }
+    } else {
+      if (verifiedTag && verifiedTag !== tag) {
+        log(
+          `cloudflared on disk was verified against ${verifiedTag}; pin is now ` +
+            `${tag}. Delete ${target} to fetch and verify the pinned build.`,
+        );
+      } else if (!verifiedTag) {
+        log(
+          `cloudflared on disk predates checksum verification. Delete ${target} ` +
+            'to re-fetch it against the pinned release.',
+        );
+      }
+      return target;
     }
-    if (verifiedTag && verifiedTag !== tag) {
-      log(
-        `cloudflared on disk was verified against ${verifiedTag}; pin is now ` +
-          `${tag}. Delete ${target} to fetch and verify the pinned build.`,
-      );
-    } else if (!verifiedTag) {
-      log(
-        `cloudflared on disk predates checksum verification. Delete ${target} ` +
-          'to re-fetch it against the pinned release.',
-      );
-    }
-    return target;
   }
 
   const { asset, archive } = assetFor();
@@ -353,7 +531,9 @@ export async function ensureCloudflared(
     }
   }
 
-  await fs.promises.chmod(target, 0o755);
+  // No-op on Windows (NTFS has no mode bits), and it throws on some
+  // filesystems there rather than being ignored.
+  if (process.platform !== 'win32') await fs.promises.chmod(target, 0o755);
   fs.writeFileSync(
     markerPath(binDir),
     JSON.stringify({ tag, asset, sha256: expected }, null, 2),
@@ -378,6 +558,10 @@ export class Tunnel {
   private lastTick = Date.now();
   private failures = 0;
   private recycling = false;
+  /** Consecutive child deaths that never produced a url. */
+  private spawnFailures = 0;
+  /** True while an acquire+spawn cycle is in flight, so two cannot race. */
+  private acquiring = false;
   url: string | null = null;
 
   constructor(private readonly opts: TunnelOptions) {}
@@ -450,10 +634,32 @@ export class Tunnel {
       }
     }, 5_000);
     hard.unref?.();
-    child.once('exit', () => {
+
+    /*
+     * `recycling` MUST come back down, on every path.
+     *
+     * It was cleared only from `exit`, and `exit` is precisely the event a
+     * child that never started does not emit: a spawn failure (a deleted
+     * or non-executable binary) emits `error` then `close` and nothing
+     * else. That left the flag stuck true, and a stuck flag makes every
+     * later `recycle` a no-op -- so the one fault the watchdog exists to
+     * repair became the one fault it could never repair. `close` is
+     * emitted for both outcomes, and the timer is the backstop for an
+     * emitter that somehow emits neither.
+     */
+    let settled = false;
+    let giveUp: NodeJS.Timeout | null = null;
+    const release = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(hard);
+      if (giveUp) clearTimeout(giveUp);
       this.recycling = false;
-    });
+    };
+    giveUp = setTimeout(release, 15_000);
+    giveUp.unref?.();
+    child.once('exit', release);
+    child.once('close', release);
   }
 
   private async tick(period: number): Promise<void> {
@@ -499,22 +705,99 @@ export class Tunnel {
     this.monitor.unref?.();
   }
 
-  async start(): Promise<void> {
-    this.stopped = false;
-    this.startMonitor();
+  /** Resolve the binary to spawn, downloading and verifying if needed. */
+  private async acquire(revalidate = false): Promise<string> {
     const supplied = userSuppliedCloudflared(this.opts.cloudflaredPath);
     if (supplied) {
       // Their binary, their call: nothing to verify and nothing to fetch.
       this.log(`using cloudflared at ${supplied}`);
-      this.spawnOnce(supplied);
-      return;
+      return supplied;
     }
-    const bin = this.opts.downloadFn
-      ? path.join(this.opts.binDir, 'cloudflared')
-      : await ensureCloudflared(this.opts.binDir, (m) => this.log(m));
-    if (this.opts.downloadFn) await this.opts.downloadFn(bin);
-    this.spawnOnce(bin);
+    if (this.opts.downloadFn) {
+      const bin = cloudflaredBinaryPath(this.opts.binDir);
+      await this.opts.downloadFn(bin);
+      return bin;
+    }
+    return ensureCloudflared(this.opts.binDir, (m) => this.log(m), {
+      revalidate,
+    });
   }
+
+  /**
+   * Bring the tunnel up, and keep trying until it does.
+   *
+   * This used to be a single attempt whose rejection the caller could only
+   * log. The realistic way it fails is the download: a machine that just
+   * booted or just woke runs this before the network is up, `fetch`
+   * throws, and the tunnel was then down permanently -- the watchdog spins
+   * without a url to probe and nothing ever retries. That is the exact
+   * failure class the rest of this file exists to survive, so it is
+   * retried here too, with the same capped backoff shape.
+   */
+  async start(): Promise<void> {
+    this.stopped = false;
+    this.startMonitor();
+    return this.acquireAndSpawn(true);
+  }
+
+  /**
+   * Get a binary and spawn it, retrying the ACQUIRE with backoff.
+   *
+   * `first` distinguishes the initial call, which still rejects when the
+   * retry is switched off so a caller can see the failure, from the
+   * re-acquisitions driven by `spawnOnce` -- those have nobody to reject
+   * to and must never throw into a timer callback.
+   */
+  private async acquireAndSpawn(
+    first = false,
+    revalidate = false,
+  ): Promise<void> {
+    if (this.acquiring) return;
+    this.acquiring = true;
+    const base = this.opts.startRetryMs ?? 5_000;
+    let attempt = 0;
+    try {
+      for (;;) {
+        if (this.stopped) return;
+        try {
+          const bin = await this.acquire(revalidate);
+          if (this.stopped) return;
+          this.spawnFailures = 0;
+          this.spawnOnce(bin);
+          return;
+        } catch (err) {
+          if (this.stopped) return;
+          if (base <= 0) {
+            if (first) throw err;
+            this.log(`tunnel could not be acquired: ${(err as Error).message}`);
+            return;
+          }
+          attempt += 1;
+          const delay = Math.min(60_000, base * 2 ** Math.min(attempt - 1, 4));
+          this.log(
+            `tunnel could not start (attempt ${attempt}): ` +
+              `${(err as Error).message}; retrying in ${delay}ms`,
+          );
+          // Deliberately NOT `this.timer`: `stop()` clears that one, and a
+          // cleared timer here would suspend this loop forever instead of
+          // letting it wake up and see `stopped`.
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, delay).unref?.();
+          });
+        }
+      }
+    } finally {
+      this.acquiring = false;
+    }
+  }
+
+  /**
+   * Consecutive deaths that produced no url before one is treated as
+   * "this binary is not usable" rather than "the network is having a
+   * moment". Two is enough to rule out a one-off while still repairing
+   * quickly; a tunnel that comes up and prints a hostname resets it.
+   */
+  private static readonly REACQUIRE_AFTER = 2;
 
   private spawnOnce(bin: string): void {
     if (this.stopped) return;
@@ -545,18 +828,65 @@ export class Tunnel {
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
 
-    child.on('exit', (code) => {
+    /*
+     * `exit` is not emitted when the spawn itself fails -- a binary that
+     * was deleted or is not executable gives `error` then `close`, so a
+     * restart hung off `exit` alone never fired and the tunnel stayed
+     * down with one line in the log. Both are handled, once.
+     */
+    let ended = false;
+    const onEnd = (code: number | null) => {
+      if (ended) return;
+      ended = true;
       this.child = null;
       if (this.stopped) return;
+      // A run that never printed a hostname did not work. Counting those
+      // separately from ordinary exits is what tells "the binary is gone"
+      // apart from "the network dropped".
+      const producedUrl = this.url !== null;
       // A rotated hostname must not be reported as still live.
       this.url = null;
       this.restarts += 1;
+      this.spawnFailures = producedUrl ? 0 : this.spawnFailures + 1;
       const delay = Math.min(30_000, 1000 * 2 ** Math.min(this.restarts, 5));
+
+      /*
+       * Re-acquire rather than re-spawn a path that does not work.
+       *
+       * `bin` is captured once, at start, and every restart used to reuse
+       * it. If the binary is deleted, truncated by a failed upgrade, or
+       * loses its executable bit while we run, the spawn fails with
+       * ENOENT/EACCES -- which is `error` + `close`, so the restart fires,
+       * spawns the same dead path, fails identically, and does that
+       * forever at a 30s cap with the tunnel permanently down. Going back
+       * through `acquire()` re-downloads and re-verifies against the
+       * pinned checksum, which is the only thing that can actually repair
+       * it. The same backoff timer gates it, so this is not a tight loop.
+       */
+      if (this.spawnFailures >= Tunnel.REACQUIRE_AFTER) {
+        this.spawnFailures = 0;
+        this.log(
+          `tunnel exited (${code}) without a url twice; re-acquiring ` +
+            `cloudflared in ${delay}ms`,
+        );
+        this.timer = setTimeout(() => {
+          // `revalidate`: the binary just failed to produce a hostname
+          // twice, so "there is a file there" is not good enough any more.
+          void this.acquireAndSpawn(false, true).catch((err) =>
+            this.log(`tunnel re-acquire failed: ${(err as Error).message}`),
+          );
+        }, delay);
+        this.timer.unref?.();
+        return;
+      }
+
       this.log(`tunnel exited (${code}); restarting in ${delay}ms`);
       this.timer = setTimeout(() => this.spawnOnce(bin), delay);
       this.timer.unref?.();
-    });
+    };
 
+    child.on('exit', onEnd);
+    child.on('close', onEnd);
     child.on('error', (err) => this.log(`tunnel error: ${err.message}`));
   }
 
@@ -565,8 +895,35 @@ export class Tunnel {
     if (this.timer) clearTimeout(this.timer);
     if (this.monitor) clearInterval(this.monitor);
     this.monitor = null;
+    this.recycling = false;
     this.child?.kill('SIGTERM');
     this.child = null;
+  }
+}
+
+/**
+ * How long a single Bot API call may take before it is abandoned.
+ *
+ * Both calls here run on timers whose whole purpose is to repair drift. A
+ * request with no deadline, made over the flaky network these timers exist
+ * to survive, can hang for as long as the OS keeps the socket open -- and
+ * while it hangs the reconcile loop is not reconciling. A short cap turns
+ * that into a retried failure instead of a stall.
+ */
+const BOT_API_TIMEOUT_MS = 15_000;
+
+/** Run `fetchFn` with an abort deadline, whatever it is. */
+async function fetchWithTimeout(
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BOT_API_TIMEOUT_MS);
+  try {
+    return await fetchFn(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -584,7 +941,8 @@ export async function readMenuButton(
 ): Promise<string | null> {
   const query =
     chatId === undefined ? '' : `?chat_id=${encodeURIComponent(String(chatId))}`;
-  const res = await fetchFn(
+  const res = await fetchWithTimeout(
+    fetchFn,
     `https://api.telegram.org/bot${botToken}/getChatMenuButton${query}`,
   );
   const body = (await res.json()) as {
@@ -635,6 +993,22 @@ export class MenuSync {
   private retry: NodeJS.Timeout | null = null;
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
+  private reconciling = false;
+  /**
+   * Bumped on every change of target.
+   *
+   * A quick tunnel rotates its hostname, so two writes for two different
+   * urls can be in flight at once -- and the Bot API does not promise they
+   * are served in the order they were sent. Without this, a slow write for
+   * the OLD url could land AFTER the fast write for the new one, leaving
+   * Telegram pointed at a dead hostname and `confirmed` recording a url
+   * that is no longer the target. The reconcile loop would eventually
+   * repair it, but "eventually" there is up to two minutes, which is well
+   * past the point the owner has tapped the menu button and got nothing.
+   */
+  private generation = 0;
+  /** Serialises pushes, so only one write is ever outstanding. */
+  private pushing: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: MenuSyncOptions) {}
 
@@ -650,13 +1024,36 @@ export class MenuSync {
       // Bot API write every 45s for the life of the process, to say
       // something Telegram already knows.
       if (this.confirmed === url) return;
-      void this.push();
+      void this.enqueuePush();
       return;
     }
     this.target = url;
     this.attempt = 0;
     this.confirmed = null;
-    void this.push();
+    this.generation += 1;
+    // A retry armed for the previous url is now meaningless.
+    if (this.retry) {
+      clearTimeout(this.retry);
+      this.retry = null;
+    }
+    void this.enqueuePush();
+  }
+
+  /**
+   * Run pushes one at a time, newest target wins.
+   *
+   * Chaining rather than firing in parallel is what makes the generation
+   * check sufficient: a superseded write is either still queued (and is
+   * then dropped without ever reaching Telegram) or is the one in flight
+   * (and is then not allowed to record its result).
+   */
+  private enqueuePush(): Promise<void> {
+    const mine = this.generation;
+    this.pushing = this.pushing.then(
+      () => this.push(mine),
+      () => this.push(mine),
+    );
+    return this.pushing;
   }
 
   private schedule(): void {
@@ -677,14 +1074,17 @@ export class MenuSync {
     const delay = Math.min(60_000, 2000 * 2 ** step);
     this.retry = setTimeout(() => {
       this.retry = null;
-      void this.push();
+      void this.enqueuePush();
     }, delay);
     this.retry.unref?.();
   }
 
-  private async push(): Promise<void> {
+  private async push(generation = this.generation): Promise<void> {
     const url = this.target;
     if (this.stopped || !url) return;
+    // Superseded before this write even started: sending it would point
+    // Telegram back at the previous hostname.
+    if (generation !== this.generation) return;
     this.attempt += 1;
     try {
       const res = await registerMenuButton(
@@ -693,6 +1093,14 @@ export class MenuSync {
         this.opts.chatId,
         this.opts.fetchFn || fetch,
       );
+      // Superseded WHILE in flight. Telegram may have taken this write,
+      // but the newer one is the truth -- so do not record it as confirmed
+      // (that would make `setTarget` think there is nothing to do) and let
+      // the newer target's own push stand.
+      if (generation !== this.generation) {
+        this.log('menu button write superseded by a newer url; discarding');
+        return;
+      }
       if (!res.ok) {
         this.log(`menu button rejected: ${res.description || 'unknown'}`);
         this.schedule();
@@ -702,6 +1110,7 @@ export class MenuSync {
       this.attempt = 0;
       this.log('menu button registered');
     } catch (err) {
+      if (generation !== this.generation) return;
       this.log(
         `menu button attempt ${this.attempt} failed: ${(err as Error).message}`,
       );
@@ -718,22 +1127,33 @@ export class MenuSync {
    */
   async reconcile(): Promise<void> {
     const url = this.target;
+    const generation = this.generation;
     if (this.stopped || !url) return;
+    // The reconcile timer and every health probe both call this. Without a
+    // guard a slow Bot API round-trip stacks calls on top of each other,
+    // each one able to re-push the button.
+    if (this.reconciling) return;
+    this.reconciling = true;
     try {
       const live = await readMenuButton(
         this.opts.botToken,
         this.opts.chatId,
         this.opts.fetchFn || fetch,
       );
+      // The target may have rotated while this read was in flight; what
+      // Telegram said about the OLD url tells us nothing about the new one.
+      if (generation !== this.generation) return;
       if (sameMenuUrl(live, url)) {
         this.confirmed = url;
         return;
       }
       this.log(`menu button drifted (telegram has ${live || 'none'}); repairing`);
       this.attempt = 0;
-      await this.push();
+      await this.enqueuePush();
     } catch {
       // Offline. The next tick tries again; nothing to do here.
+    } finally {
+      this.reconciling = false;
     }
   }
 
@@ -802,7 +1222,8 @@ export async function registerMenuButton(
   chatId: number | undefined,
   fetchFn: typeof fetch = fetch,
 ): Promise<{ ok: boolean; description?: string }> {
-  const res = await fetchFn(
+  const res = await fetchWithTimeout(
+    fetchFn,
     `https://api.telegram.org/bot${botToken}/setChatMenuButton`,
     {
       method: 'POST',

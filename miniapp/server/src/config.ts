@@ -180,7 +180,15 @@ export function defaultAsideRoot(home = os.homedir()): string {
     const raw = JSON.parse(
       fs.readFileSync(path.join(home, '.aside/accounts.json'), 'utf8'),
     ) as { currentAccountId?: unknown };
-    const id = Number(raw.currentAccountId);
+    // `Number(true)` is 1 and `Number(false)` is 0, so a boolean here used
+    // to resolve to a real-looking account directory -- silently pointing
+    // the whole app at u/1 because a field was written as `true`. Only an
+    // actual number (or a numeric string) may name an account.
+    const value = raw.currentAccountId;
+    const id =
+      typeof value === 'number' || typeof value === 'string'
+        ? Number(value)
+        : NaN;
     if (Number.isInteger(id) && id >= 0) {
       return path.join(home, '.aside/u', String(id));
     }

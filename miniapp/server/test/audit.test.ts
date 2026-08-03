@@ -750,15 +750,20 @@ describe('A-3 the WebSocket upgrade is gated', () => {
    * and outside the rate limiter. A tokenless socket that simply said
    * nothing used to be held open forever; 200 of them were accepted in a
    * second, each adding four listeners to the runner's emitters.
+   *
+   * It is now refused at the handshake instead of accepted-then-dropped,
+   * so it never becomes a client at all -- see the upgrade handler. The
+   * socket therefore errors rather than opening.
    */
-  it('drops a socket that never authenticates', async () => {
+  it('refuses a tokenless socket at the handshake', async () => {
     const ws = new WebSocket(wsUrl);
-    await new Promise((r) => ws.on('open', r));
-    const code = await new Promise<number>((resolve) => {
-      ws.on('close', (c) => resolve(c));
-      setTimeout(() => resolve(-1), 9_000);
+    const outcome = await new Promise<string>((resolve) => {
+      ws.on('open', () => resolve('opened'));
+      ws.on('error', () => resolve('refused'));
+      setTimeout(() => resolve('timeout'), 9_000);
     });
-    expect(code).toBe(4401);
+    expect(outcome).toBe('refused');
+    ws.terminate();
   }, 15_000);
 
   it('refuses new upgrades past the connection ceiling', async () => {

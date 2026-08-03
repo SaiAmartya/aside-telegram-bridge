@@ -1,7 +1,5 @@
 # aside-telegram-bridge
 
-> **A fork.** This builds on [SaiAmartya/aside-telegram-bridge](https://github.com/SaiAmartya/aside-telegram-bridge) and stays MIT licensed, with the original copyright intact. Changes here: a self-healing Cloudflare tunnel that survives sleep/wake, a model catalog read live from the Aside desktop app instead of a hand-kept copy, account auto-detection, and a rebuilt mobile UI.
-
 Text your [Aside](https://aside.so) browser agent from your phone.
 
 Your full Aside agent -- tools, memory, everything -- living in a Telegram
@@ -13,7 +11,7 @@ progress fold into a tidy collapsible worklog when it's done.
 Open Terminal and paste:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Parthkkk/aside-telegram-bridge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/SaiAmartya/aside-telegram-bridge/main/install.sh | bash
 ```
 
 The setup wizard walks you through the rest:
@@ -93,9 +91,15 @@ aside: Drafted a reply. Want to see it before I send?
 The chat is for texting your agent. The Mini App is for *watching* it work:
 the full Aside UI, inside Telegram, on the phone you already have out.
 
-| Home | Sessions | Model &amp; reasoning |
+https://github.com/user-attachments/assets/d119cb77-8860-463e-87b5-88b98212fc29
+
+| Home | Recents | Model &amp; reasoning |
 |:---:|:---:|:---:|
 | <img src="docs/screenshots/home.jpg" alt="The mini app home screen: a greeting and the composer, with history one swipe below" width="240"/> | <img src="docs/screenshots/history.jpg" alt="The session list, showing recent Aside chats with timestamps" width="240"/> | <img src="docs/screenshots/models.jpg" alt="The model sheet, listing whatever providers and models the desktop app has configured" width="240"/> |
+
+<sub>Captured from a fixture install: the name, the session titles and the
+provider list above are all invented test data, not anyone's real
+sessions.</sub>
 
 Opening the app lands on a quiet screen: the mark, a greeting and the
 composer. Your history is one swipe below, scrolling up from under the
@@ -269,7 +273,7 @@ an approval, a blocker) escapes the fold and pings for real.
 <summary><b>Manual setup</b> (if you'd rather not pipe curl to bash)</summary>
 
 ```bash
-git clone https://github.com/Parthkkk/aside-telegram-bridge
+git clone https://github.com/SaiAmartya/aside-telegram-bridge
 cd aside-telegram-bridge
 python3 setup.py
 ```
@@ -279,6 +283,9 @@ The wizard is the same either way. Fully manual (no wizard): copy
 `owner_name`, chmod 600 it, then install
 `com.aside.telegram-bridge.plist` into `~/Library/LaunchAgents` with the
 paths corrected, and `launchctl bootstrap gui/$(id -u) <plist>`.
+Leave `aside_cli` / `sessions_dir` / `credentials_path` empty and they are
+detected from the Aside account you are signed in to; set any of them and
+your value is kept, including across a later `python3 setup.py`.
 
 Style: `config.json`'s `"style"` is `"formal"` (default, capitalised
 professional prose) or `"casual"` (deliberately lowercase, dry, texting
@@ -287,9 +294,10 @@ slang); you can fully override with your own `"persona_prompt"` /
 creation, so an existing session keeps the voice it was created with:
 re-running `setup.py` with a different style clears the primed session
 for you, but if you hand-edit `config.json` send `/new` to pick the
-change up. `default_effort` (default `high`) sets the thinking
-effort every normal turn runs at; use `/effort` in chat to bump a single
-upcoming turn to any level (off through ultrabrowse).
+change up. `default_effort` sets the thinking effort every normal turn
+runs at -- the wizard writes `medium`, and `high` is the fallback when the
+key is absent entirely; use `/effort` in chat to bump a single upcoming
+turn to any level (off through ultrabrowse).
 
 </details>
 
@@ -317,3 +325,9 @@ upcoming turn to any level (off through ultrabrowse).
 Designed, built, tested, and documented by an Aside agent, working as a
 digital co-founder for [@SaiAmartya](https://github.com/SaiAmartya), who had
 the good ideas, caught the UX regressions, and made the executive calls.
+
+The self-healing Cloudflare tunnel, the live desktop model catalog, Aside
+account auto-detection and the rebuilt mobile UI came from
+[@Parthkkk](https://github.com/Parthkkk), offered back upstream from a fork
+(MIT, copyright retained in `LICENSE`). The provider-qualified model id map
+came from [@mosidevv](https://github.com/mosidevv).

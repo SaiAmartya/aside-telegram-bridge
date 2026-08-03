@@ -710,13 +710,17 @@
   );
 }
 
-/* Webviews without backdrop-filter get an opaque bar rather than a
-   translucent one that renders as muddy. */
-@supports not (backdrop-filter: blur(1px)) {
-  .thread-footer {
-    background: var(--background);
-  }
-}
+/*
+ * No backdrop-filter override here any more.
+ *
+ * There used to be an `@supports not (backdrop-filter: blur(1px))` rule
+ * repainting this bar opaque, from when the footer WAS a blurred bar. The
+ * footer is now a `color-mix` gradient with a solid `var(--page)` first
+ * declaration as its own fallback, so that rule no longer described
+ * anything -- it just overwrote the gradient with a flat, differently
+ * coloured block on exactly the webviews it claimed to be helping (older
+ * WebKit, which needs `-webkit-backdrop-filter` and so failed the query).
+ */
 
 .bottom-bar {
   display: flex;
