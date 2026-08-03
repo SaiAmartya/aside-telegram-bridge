@@ -2,15 +2,22 @@
   "token": "YOUR_BOT_TOKEN_FROM_BOTFATHER",
   "chat_id": 123456789,
   "owner_name": "yourname",
-  "_comment_default_model": "Leave empty to mirror the Aside desktop app's own default model, read live from its settings.json. Set a provider/model id only if you want the phone pinned to something different.",
+  "_comment_default_model": "Leave empty to mirror the Aside desktop app's own default model, read live from its settings.json. Set a bare model id only if you want the phone pinned to something different; model_ids below is what qualifies it with a provider.",
   "default_model": "",
   "default_effort": "medium",
   "session_id": "",
-  "_comment_paths": "setup.py fills these in for whichever Aside account you are signed in to (see ~/.aside/accounts.json). Only set them by hand if your install lives somewhere unusual.",
+  "_comment_paths": "Leave these empty and both the bridge and the Mini App detect them from whichever Aside account you are signed in to (see ~/.aside/accounts.json). setup.py fills them in for you; a value you set by hand is kept as-is, including when you re-run setup.py.",
   "aside_cli": "",
   "sessions_dir": "",
   "credentials_path": "",
   "exec_timeout_seconds": 1200,
+  "_comment_model_maps": "Both maps MERGE over the built-in defaults, so listing one entry overrides that entry and leaves the rest alone. model_aliases maps what you type after /model to a bare model id; model_ids qualifies that bare id with the provider that actually hosts it, which is what `aside exec -m` requires.",
+  "model_aliases": {
+    "sonnet": "claude-sonnet-5"
+  },
+  "model_ids": {
+    "claude-sonnet-5": "claude-code/claude-sonnet-5"
+  },
   "sessions_list_limit": 8,
   "style": "formal",
   "miniapp": {
